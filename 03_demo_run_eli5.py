@@ -30,6 +30,14 @@
 
 # COMMAND ----------
 
+# MAGIC %pip install matplotlib
+
+# COMMAND ----------
+
+dbutils.library.restartPython()
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## Our Test Portfolio
 # MAGIC

@@ -17,6 +17,14 @@
 
 # COMMAND ----------
 
+# MAGIC %pip install statsmodels scikit-learn mlflow matplotlib
+
+# COMMAND ----------
+
+dbutils.library.restartPython()
+
+# COMMAND ----------
+
 # MAGIC %md
 # MAGIC ## 0. Setup — Create Schema & Configure MLflow
 

@@ -7,6 +7,14 @@
 
 # COMMAND ----------
 
+# MAGIC %pip install mlflow matplotlib
+
+# COMMAND ----------
+
+dbutils.library.restartPython()
+
+# COMMAND ----------
+
 # Setup
 CATALOG = "lr_serverless_aws_us_catalog"
 SCHEMA = "pricing_new_data_impact"
