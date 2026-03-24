@@ -32,20 +32,19 @@ portfolio = spark.table("portfolio")
 pdf = portfolio.toPandas()
 
 n_policies = len(pdf)
-claim_rate = pdf["claim_flag"].mean() if "claim_flag" in pdf.columns else pdf["claim_count"].clip(upper=1).mean()
-avg_severity = pdf.loc[pdf["claim_amount"] > 0, "claim_amount"].mean() if "claim_amount" in pdf.columns else None
+claim_rate = (pdf["num_claims"] > 0).mean()
+avg_severity = pdf.loc[pdf["num_claims"] > 0, "claim_severity"].mean()
 
 print(f"Policies:        {n_policies:,}")
 print(f"Claim rate:      {claim_rate:.2%}")
-if avg_severity is not None:
-    print(f"Avg severity:    £{avg_severity:,.0f}")
+print(f"Avg severity:    £{avg_severity:,.0f}")
 
 # COMMAND ----------
 
 # Distribution of key features
 fig, axes = plt.subplots(1, 3, figsize=(14, 4))
 
-feature_cols = [c for c in ["property_type", "flood_risk_zone", "region"] if c in pdf.columns][:3]
+feature_cols = [c for c in ["property_type", "flood_risk_zone", "construction"] if c in pdf.columns][:3]
 for ax, col in zip(axes, feature_cols):
     pdf[col].value_counts().sort_index().plot.bar(ax=ax, edgecolor="white")
     ax.set_title(col.replace("_", " ").title())
@@ -71,9 +70,9 @@ mc = model_comparison.toPandas().set_index("metric") if "metric" in model_compar
 
 # Quick highlights
 if "metric" in model_comparison.columns:
-    std_vals = mc["standard"].astype(float)
-    enr_vals = mc["enriched"].astype(float)
-    for metric in ["AIC", "BIC", "gini", "deviance_explained"]:
+    std_vals = mc["model_1_standard"].astype(float)
+    enr_vals = mc["model_2_enriched"].astype(float)
+    for metric in ["AIC", "BIC", "Gini (test)", "Deviance Explained"]:
         if metric in mc.index:
             s, e = std_vals[metric], enr_vals[metric]
             direction = "▼" if e < s else "▲"
@@ -90,7 +89,7 @@ coefficients = spark.table("glm_coefficients").toPandas()
 
 # Pivot to show standard vs enriched side by side
 pivot = coefficients.pivot_table(
-    index="feature", columns="model", values="coefficient", aggfunc="first"
+    index="feature", columns="model", values="coef", aggfunc="first"
 ).rename(columns=lambda c: c.strip())
 
 if "p_value" in coefficients.columns:
@@ -105,9 +104,9 @@ display(spark.createDataFrame(pivot.reset_index()))
 
 # Enrichment features — statistical significance
 enrichment_features = ["flood_risk_zone", "crime_index", "subsidence_risk",
-                       "epc_rating", "tree_proximity", "coastal_distance"]
+                       "distance_fire_station_km", "annual_rainfall_mm"]
 enrich_mask = coefficients["feature"].isin(enrichment_features) & (coefficients["model"].str.contains("enriched", case=False))
-sig = coefficients.loc[enrich_mask, ["feature", "coefficient", "p_value"]].sort_values("p_value")
+sig = coefficients.loc[enrich_mask, ["feature", "coef", "p_value"]].sort_values("p_value")
 if not sig.empty:
     print("Enrichment features — enriched model")
     print(sig.to_string(index=False))
@@ -180,11 +179,10 @@ print(f"Max decrease:                    £{priced['quote_diff'].min():.2f}")
 
 # Where pricing diverges most — high flood risk and subsidence
 high_risk = priced[
-    (priced.get("flood_risk_zone", pd.Series(dtype=str)).isin(["high", "very_high", "High", "Very High"])) |
-    (priced.get("subsidence_risk", pd.Series(dtype=str)).isin(["high", "very_high", "High", "Very High"]))
+    (priced["flood_risk_zone"] >= 3) | (priced["subsidence_risk"] == 1)
 ].nlargest(10, "quote_diff")
 
-display(spark.createDataFrame(high_risk[["policy_id", "flood_risk_zone", "subsidence_risk",
+display(spark.createDataFrame(high_risk[["flood_risk_zone", "subsidence_risk",
                                           "quote_standard", "quote_enriched", "quote_diff"]]))
 
 # COMMAND ----------
@@ -214,7 +212,7 @@ seg_cols = [c for c in ["flood_risk_zone", "subsidence_risk"] if c in priced.col
 
 for col in seg_cols:
     seg = priced.groupby(col).agg(
-        n=("policy_id", "count"),
+        n=("quote_standard", "count"),
         avg_standard=("quote_standard", "mean"),
         avg_enriched=("quote_enriched", "mean"),
     ).reset_index()
@@ -255,12 +253,17 @@ print(f"Loaded model from {model_uri}")
 
 # Score a small sample
 sample = spark.table("priced_portfolio").limit(5).toPandas()
-feature_cols = [c for c in sample.columns if c not in ["policy_id", "claim_flag", "claim_count",
-                                                         "claim_amount", "quote_standard",
-                                                         "quote_enriched"]]
-preds = model.predict(sample[feature_cols])
+enriched_features = [
+    "building_age", "bedrooms", "sum_insured", "prior_claims", "policy_tenure",
+    "property_type_flat", "property_type_semi_detached", "property_type_terraced",
+    "construction_other", "construction_stone", "construction_timber",
+    "occupancy_tenant",
+    "flood_risk_zone", "crime_index", "distance_fire_station_km",
+    "annual_rainfall_mm", "subsidence_risk",
+]
+preds = model.predict(sample[enriched_features].astype(float))
 sample["predicted_frequency"] = preds
-display(spark.createDataFrame(sample[["policy_id"] + feature_cols[:5] + ["predicted_frequency"]]))
+display(spark.createDataFrame(sample[enriched_features[:5] + ["predicted_frequency"]]))
 
 # COMMAND ----------
 

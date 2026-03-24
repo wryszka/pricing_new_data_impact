@@ -44,7 +44,6 @@ import statsmodels.api as sm
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import matplotlib.pyplot as plt
-import pickle
 
 np.random.seed(42)
 N = 50_000
