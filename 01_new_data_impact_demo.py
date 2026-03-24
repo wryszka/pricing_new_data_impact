@@ -149,8 +149,10 @@ df = pd.DataFrame({
     "total_loss": total_loss,
 })
 
-# One-hot encode for modelling
+# One-hot encode for modelling (cast to int to avoid uint8 arrow issues)
 df_encoded = pd.get_dummies(df, columns=["property_type", "construction", "occupancy"], drop_first=True)
+bool_cols = df_encoded.select_dtypes(include=["bool", "uint8"]).columns
+df_encoded[bool_cols] = df_encoded[bool_cols].astype(int)
 
 # Save raw portfolio to UC
 spark.createDataFrame(df).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.portfolio")
@@ -241,11 +243,17 @@ def fit_and_log_glm(train, test, features, model_name, label="num_claims"):
             "gini_test": gini,
         })
 
-        # Log model as pyfunc for UC registration
+        # Log model as pyfunc for UC registration — signature required
+        from mlflow.models.signature import infer_signature
+        sample_input = test[features].head(5).astype(float)
+        sample_output = pd.Series(model.predict(sm.add_constant(sample_input)), name="predicted_frequency")
+        signature = infer_signature(sample_input, sample_output)
+
         mlflow.pyfunc.log_model(
             artifact_path="model",
             python_model=GLMWrapper(model, features),
             registered_model_name=uc_model_name,
+            signature=signature,
         )
 
         run_id = run.info.run_id
@@ -316,9 +324,9 @@ metrics = ["aic", "bic", "deviance", "null_deviance", "deviance_explained", "mae
 labels = ["AIC", "BIC", "Deviance", "Null Deviance", "Deviance Explained", "MAE (test)", "RMSE (test)", "Gini (test)"]
 
 comparison = pd.DataFrame({
-    "Metric": labels,
-    "Model 1 — Standard": [f"{m1[m]:.4f}" for m in metrics],
-    "Model 2 — Enriched": [f"{m2[m]:.4f}" for m in metrics],
+    "metric": labels,
+    "model_1_standard": [f"{m1[m]:.4f}" for m in metrics],
+    "model_2_enriched": [f"{m2[m]:.4f}" for m in metrics],
 })
 
 spark_comp = spark.createDataFrame(comparison)
@@ -439,6 +447,8 @@ coef_m2.columns = ["feature", "coef", "std_err", "z", "p_value", "ci_low", "ci_h
 coef_m2["model"] = "enriched"
 
 coef_all = pd.concat([coef_m1, coef_m2])
+for c in ["coef", "std_err", "z", "p_value", "ci_low", "ci_high"]:
+    coef_all[c] = coef_all[c].astype(float)
 spark.createDataFrame(coef_all).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.glm_coefficients")
 display(spark.table(f"{CATALOG}.{SCHEMA}.glm_coefficients"))
 
