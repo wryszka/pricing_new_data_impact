@@ -10,6 +10,26 @@
 # MAGIC |---|---|---|
 # MAGIC | **Features** | Classic rating factors | Standard + geo/risk enrichment |
 # MAGIC | **Goal** | Baseline performance | Show uplift from new data |
+# MAGIC
+# MAGIC **All artefacts are persisted to Unity Catalog:**
+# MAGIC - Tables → `lr_serverless_aws_us_catalog.pricing_new_data_impact`
+# MAGIC - Models → same catalog, registered via MLflow
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 0. Setup — Create Schema & Configure MLflow
+
+# COMMAND ----------
+
+CATALOG = "lr_serverless_aws_us_catalog"
+SCHEMA = "pricing_new_data_impact"
+
+spark.sql(f"CREATE SCHEMA IF NOT EXISTS {CATALOG}.{SCHEMA}")
+spark.sql(f"USE {CATALOG}.{SCHEMA}")
+
+import mlflow
+mlflow.set_registry_uri("databricks-uc")
 
 # COMMAND ----------
 
@@ -20,11 +40,11 @@
 
 import numpy as np
 import pandas as pd
-from pyspark.sql import functions as F
 import statsmodels.api as sm
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_absolute_error, mean_squared_error
 import matplotlib.pyplot as plt
+import pickle
 
 np.random.seed(42)
 N = 50_000
@@ -41,14 +61,14 @@ building_age = 2025 - year_built
 bedrooms = np.random.choice([1, 2, 3, 4, 5], N, p=[0.1, 0.25, 0.35, 0.2, 0.1])
 sum_insured = np.round(
     np.random.lognormal(mean=12.2, sigma=0.4, size=N), -3
-)  # ~£200k median
+)
 occupancy = np.random.choice(["owner", "tenant"], N, p=[0.65, 0.35])
 prior_claims = np.random.poisson(0.15, N)
 policy_tenure = np.random.randint(0, 15, N)
 
 # --- Enrichment factors (Model 2 will use these) ---
 flood_risk_zone = np.random.choice([1, 2, 3, 4], N, p=[0.50, 0.25, 0.15, 0.10])
-crime_index = np.round(np.random.beta(2, 5, N) * 100, 1)  # 0-100, skewed low
+crime_index = np.round(np.random.beta(2, 5, N) * 100, 1)
 distance_fire_station_km = np.round(np.random.exponential(3, N), 1)
 annual_rainfall_mm = np.round(np.random.normal(800, 200, N).clip(300, 1600), 0)
 subsidence_risk = np.random.choice([0, 1], N, p=[0.85, 0.15])
@@ -82,17 +102,17 @@ log_freq = (
     + 0.05 * prior_claims
     - 0.01 * policy_tenure
     # --- enrichment effects (hidden from Model 1) ---
-    + 0.25 * (flood_risk_zone - 1) / 3        # flood zone is a strong driver
-    + 0.005 * crime_index                       # moderate effect
-    + 0.02 * (distance_fire_station_km > 5)     # step effect beyond 5km
-    + 0.0003 * (annual_rainfall_mm - 800)       # mild weather effect
-    + 0.3 * subsidence_risk                     # significant binary risk
+    + 0.25 * (flood_risk_zone - 1) / 3
+    + 0.005 * crime_index
+    + 0.02 * (distance_fire_station_km > 5).astype(float)
+    + 0.0003 * (annual_rainfall_mm - 800)
+    + 0.3 * subsidence_risk
 )
 
 claim_freq = np.exp(log_freq)
 num_claims = np.random.poisson(claim_freq)
 
-# Severity for those with claims — also influenced by enrichment
+# Severity for those with claims
 log_sev = (
     7.5
     + 0.15 * (flood_risk_zone - 1) / 3
@@ -106,12 +126,11 @@ total_loss = num_claims * claim_severity
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 3. Assemble Dataset
+# MAGIC ## 3. Assemble Dataset & Save to Unity Catalog
 
 # COMMAND ----------
 
 df = pd.DataFrame({
-    # Standard
     "property_type": property_type,
     "construction": construction,
     "building_age": building_age,
@@ -120,31 +139,30 @@ df = pd.DataFrame({
     "occupancy": occupancy,
     "prior_claims": prior_claims,
     "policy_tenure": policy_tenure,
-    # Enrichment
     "flood_risk_zone": flood_risk_zone,
     "crime_index": crime_index,
     "distance_fire_station_km": distance_fire_station_km,
     "annual_rainfall_mm": annual_rainfall_mm,
     "subsidence_risk": subsidence_risk,
-    # Target
     "num_claims": num_claims,
     "claim_severity": claim_severity,
     "total_loss": total_loss,
 })
 
-# One-hot encode categoricals
+# One-hot encode for modelling
 df_encoded = pd.get_dummies(df, columns=["property_type", "construction", "occupancy"], drop_first=True)
 
-print(f"Portfolio: {N:,} policies")
-print(f"Claim rate: {(num_claims > 0).mean():.1%}")
-print(f"Average frequency: {num_claims.mean():.3f}")
-print(f"Average severity (claimants): £{claim_severity[num_claims > 0].mean():,.0f}")
-display(df.describe())
+# Save raw portfolio to UC
+spark.createDataFrame(df).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.portfolio")
+
+print(f"Portfolio: {N:,} policies | Claim rate: {(num_claims > 0).mean():.1%}")
+print(f"Avg frequency: {num_claims.mean():.3f} | Avg severity (claimants): £{claim_severity[num_claims > 0].mean():,.0f}")
+display(spark.table(f"{CATALOG}.{SCHEMA}.portfolio").limit(10))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 4. Define Feature Sets
+# MAGIC ## 4. Train / Test Split & Feature Sets
 
 # COMMAND ----------
 
@@ -163,74 +181,14 @@ enriched_features = standard_features + [
 train_df, test_df = train_test_split(df_encoded, test_size=0.3, random_state=42)
 print(f"Train: {len(train_df):,} | Test: {len(test_df):,}")
 
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 5. Train Frequency GLMs (Poisson)
-
-# COMMAND ----------
-
-def fit_poisson_glm(train, test, features, label="num_claims"):
-    X_train = sm.add_constant(train[features].astype(float))
-    X_test = sm.add_constant(test[features].astype(float))
-    y_train = train[label]
-    y_test = test[label]
-
-    model = sm.GLM(y_train, X_train, family=sm.families.Poisson()).fit()
-
-    pred_train = model.predict(X_train)
-    pred_test = model.predict(X_test)
-
-    results = {
-        "model": model,
-        "aic": model.aic,
-        "bic": model.bic,
-        "deviance": model.deviance,
-        "null_deviance": model.null_deviance,
-        "deviance_explained": 1 - model.deviance / model.null_deviance,
-        "mae_test": mean_absolute_error(y_test, pred_test),
-        "rmse_test": np.sqrt(mean_squared_error(y_test, pred_test)),
-        "pred_test": pred_test,
-        "y_test": y_test,
-    }
-    return results
-
-print("Training Model 1 (Standard features)...")
-m1_freq = fit_poisson_glm(train_df, test_df, standard_features)
-
-print("Training Model 2 (Enriched features)...")
-m2_freq = fit_poisson_glm(train_df, test_df, enriched_features)
+# Save train/test splits to UC
+spark.createDataFrame(train_df).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.train_set")
+spark.createDataFrame(test_df).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.test_set")
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 6. Frequency Model Comparison
-
-# COMMAND ----------
-
-comparison = pd.DataFrame({
-    "Metric": ["AIC", "BIC", "Deviance", "Null Deviance", "Deviance Explained (%)", "MAE (test)", "RMSE (test)"],
-    "Model 1 — Standard": [
-        f"{m1_freq['aic']:,.1f}", f"{m1_freq['bic']:,.1f}",
-        f"{m1_freq['deviance']:,.1f}", f"{m1_freq['null_deviance']:,.1f}",
-        f"{m1_freq['deviance_explained']:.2%}",
-        f"{m1_freq['mae_test']:.4f}", f"{m1_freq['rmse_test']:.4f}",
-    ],
-    "Model 2 — Enriched": [
-        f"{m2_freq['aic']:,.1f}", f"{m2_freq['bic']:,.1f}",
-        f"{m2_freq['deviance']:,.1f}", f"{m2_freq['null_deviance']:,.1f}",
-        f"{m2_freq['deviance_explained']:.2%}",
-        f"{m2_freq['mae_test']:.4f}", f"{m2_freq['rmse_test']:.4f}",
-    ],
-})
-
-spark_comp = spark.createDataFrame(comparison)
-display(spark_comp)
-
-# COMMAND ----------
-
-# MAGIC %md
-# MAGIC ## 7. Gini Coefficient (Frequency)
+# MAGIC ## 5. Helper Functions
 
 # COMMAND ----------
 
@@ -243,22 +201,140 @@ def gini_coefficient(y_true, y_pred):
     lorenz = cum_actual_norm.sum() / n
     return 2 * lorenz - 1
 
-gini_m1 = gini_coefficient(m1_freq["y_test"].values, m1_freq["pred_test"].values)
-gini_m2 = gini_coefficient(m2_freq["y_test"].values, m2_freq["pred_test"].values)
 
-print(f"Gini — Model 1 (Standard):  {gini_m1:.4f}")
-print(f"Gini — Model 2 (Enriched):  {gini_m2:.4f}")
-print(f"Gini uplift:                 {(gini_m2 - gini_m1) / abs(gini_m1):.1%}")
+def fit_and_log_glm(train, test, features, model_name, label="num_claims"):
+    """Fit a Poisson GLM, log to MLflow, register in UC."""
+    X_train = sm.add_constant(train[features].astype(float))
+    X_test = sm.add_constant(test[features].astype(float))
+    y_train = train[label]
+    y_test = test[label]
+
+    model = sm.GLM(y_train, X_train, family=sm.families.Poisson()).fit()
+
+    pred_train = model.predict(X_train)
+    pred_test = model.predict(X_test)
+
+    deviance_explained = 1 - model.deviance / model.null_deviance
+    mae = mean_absolute_error(y_test, pred_test)
+    rmse = np.sqrt(mean_squared_error(y_test, pred_test))
+    gini = gini_coefficient(y_test.values, pred_test.values)
+
+    # Log to MLflow
+    uc_model_name = f"{CATALOG}.{SCHEMA}.{model_name}"
+    with mlflow.start_run(run_name=model_name) as run:
+        mlflow.log_params({
+            "family": "Poisson",
+            "link": "log",
+            "n_features": len(features),
+            "features": ", ".join(features),
+            "n_train": len(train),
+            "n_test": len(test),
+        })
+        mlflow.log_metrics({
+            "aic": model.aic,
+            "bic": model.bic,
+            "deviance": model.deviance,
+            "null_deviance": model.null_deviance,
+            "deviance_explained": deviance_explained,
+            "mae_test": mae,
+            "rmse_test": rmse,
+            "gini_test": gini,
+        })
+
+        # Log model as pyfunc for UC registration
+        mlflow.pyfunc.log_model(
+            artifact_path="model",
+            python_model=GLMWrapper(model, features),
+            registered_model_name=uc_model_name,
+        )
+
+        run_id = run.info.run_id
+
+    return {
+        "model": model,
+        "run_id": run_id,
+        "uc_model_name": uc_model_name,
+        "aic": model.aic,
+        "bic": model.bic,
+        "deviance": model.deviance,
+        "null_deviance": model.null_deviance,
+        "deviance_explained": deviance_explained,
+        "mae_test": mae,
+        "rmse_test": rmse,
+        "gini_test": gini,
+        "pred_test": pred_test,
+        "y_test": y_test,
+    }
+
+
+class GLMWrapper(mlflow.pyfunc.PythonModel):
+    """Wraps a statsmodels GLM so it can be logged & served via MLflow."""
+
+    def __init__(self, model, features):
+        self.model = model
+        self.features = features
+
+    def predict(self, context, model_input, params=None):
+        X = sm.add_constant(model_input[self.features].astype(float))
+        return self.model.predict(X).values
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 8. Lift Charts
+# MAGIC ## 6. Train & Register — Model 1 (Standard)
+
+# COMMAND ----------
+
+experiment_path = f"/Users/laurence.ryszka@databricks.com/pricing_new_data_impact/experiments"
+mlflow.set_experiment(experiment_path)
+
+print("Training Model 1 (Standard features)...")
+m1 = fit_and_log_glm(train_df, test_df, standard_features, "glm_frequency_standard")
+print(f"  Registered → {m1['uc_model_name']}")
+print(f"  Gini: {m1['gini_test']:.4f} | Deviance explained: {m1['deviance_explained']:.2%}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 7. Train & Register — Model 2 (Enriched)
+
+# COMMAND ----------
+
+print("Training Model 2 (Enriched features)...")
+m2 = fit_and_log_glm(train_df, test_df, enriched_features, "glm_frequency_enriched")
+print(f"  Registered → {m2['uc_model_name']}")
+print(f"  Gini: {m2['gini_test']:.4f} | Deviance explained: {m2['deviance_explained']:.2%}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 8. Side-by-Side Metric Comparison
+
+# COMMAND ----------
+
+metrics = ["aic", "bic", "deviance", "null_deviance", "deviance_explained", "mae_test", "rmse_test", "gini_test"]
+labels = ["AIC", "BIC", "Deviance", "Null Deviance", "Deviance Explained", "MAE (test)", "RMSE (test)", "Gini (test)"]
+
+comparison = pd.DataFrame({
+    "Metric": labels,
+    "Model 1 — Standard": [f"{m1[m]:.4f}" for m in metrics],
+    "Model 2 — Enriched": [f"{m2[m]:.4f}" for m in metrics],
+})
+
+spark_comp = spark.createDataFrame(comparison)
+display(spark_comp)
+
+# Save comparison table
+spark_comp.write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.model_comparison")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## 9. Lift Charts
 
 # COMMAND ----------
 
 def plot_lift_chart(y_true, y_pred, n_bins=10, label="Model"):
-    """Double lift chart — predicted vs actual by decile."""
     df_lift = pd.DataFrame({"actual": y_true.values, "predicted": y_pred.values})
     df_lift["decile"] = pd.qcut(df_lift["predicted"], n_bins, labels=False, duplicates="drop")
     grouped = df_lift.groupby("decile").agg(
@@ -270,13 +346,13 @@ def plot_lift_chart(y_true, y_pred, n_bins=10, label="Model"):
 
 fig, axes = plt.subplots(1, 2, figsize=(14, 5), sharey=True)
 
-for ax, freq, title in [
-    (axes[0], m1_freq, "Model 1 — Standard"),
-    (axes[1], m2_freq, "Model 2 — Enriched"),
+for ax, res, title in [
+    (axes[0], m1, "Model 1 — Standard"),
+    (axes[1], m2, "Model 2 — Enriched"),
 ]:
-    lift = plot_lift_chart(freq["y_test"], freq["pred_test"], label=title)
-    ax.bar(lift["decile"] - 0.15, lift["avg_actual"], width=0.3, label="Actual", alpha=0.7)
-    ax.bar(lift["decile"] + 0.15, lift["avg_predicted"], width=0.3, label="Predicted", alpha=0.7)
+    lift = plot_lift_chart(res["y_test"], res["pred_test"], label=title)
+    ax.bar(lift["decile"] - 0.15, lift["avg_actual"], width=0.3, label="Actual", alpha=0.7, color="#2196F3")
+    ax.bar(lift["decile"] + 0.15, lift["avg_predicted"], width=0.3, label="Predicted", alpha=0.7, color="#FF9800")
     ax.set_title(title)
     ax.set_xlabel("Risk Decile (low → high)")
     ax.set_ylabel("Average Claim Frequency")
@@ -289,64 +365,102 @@ plt.show()
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 9. Generate Quotes & Compare Pricing
+# MAGIC ## 10. Generate Quotes & Save Priced Portfolio
 
 # COMMAND ----------
-
-# Pure premium = predicted frequency × predicted severity
-# For simplicity, use a flat average severity and vary only by frequency model
 
 avg_severity = df.loc[df["num_claims"] > 0, "claim_severity"].mean()
-expense_load = 1.35  # 35% loading for expenses + profit
+expense_load = 1.35
 
-test_df = test_df.copy()
-test_df["quote_m1"] = np.round(m1_freq["pred_test"] * avg_severity * expense_load, 2)
-test_df["quote_m2"] = np.round(m2_freq["pred_test"] * avg_severity * expense_load, 2)
-test_df["actual_loss"] = test_df["total_loss"]
+test_out = test_df.copy()
+test_out["pred_freq_standard"] = m1["pred_test"].values
+test_out["pred_freq_enriched"] = m2["pred_test"].values
+test_out["quote_standard"] = np.round(m1["pred_test"].values * avg_severity * expense_load, 2)
+test_out["quote_enriched"] = np.round(m2["pred_test"].values * avg_severity * expense_load, 2)
+test_out["actual_loss"] = test_out["total_loss"]
 
-# Show sample quotes
-sample = test_df[["building_age", "bedrooms", "sum_insured", "flood_risk_zone",
-                   "subsidence_risk", "quote_m1", "quote_m2", "actual_loss"]].head(20)
-display(spark.createDataFrame(sample))
+# Save the full priced test set
+spark.createDataFrame(test_out).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.priced_portfolio")
+
+display(spark.table(f"{CATALOG}.{SCHEMA}.priced_portfolio").select(
+    "building_age", "bedrooms", "sum_insured", "flood_risk_zone", "subsidence_risk",
+    "quote_standard", "quote_enriched", "actual_loss"
+).limit(20))
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 10. Pricing Accuracy: Actual vs Quoted Loss Ratios by Decile
+# MAGIC ## 11. Loss Ratio Analysis by Decile
 
 # COMMAND ----------
 
-for model_name, quote_col in [("Model 1 — Standard", "quote_m1"), ("Model 2 — Enriched", "quote_m2")]:
-    test_df["decile"] = pd.qcut(test_df[quote_col], 10, labels=False, duplicates="drop")
-    lr_by_decile = test_df.groupby("decile").agg(
+lr_rows = []
+for model_name, quote_col in [("Standard", "quote_standard"), ("Enriched", "quote_enriched")]:
+    temp = test_out.copy()
+    temp["decile"] = pd.qcut(temp[quote_col], 10, labels=False, duplicates="drop")
+    grouped = temp.groupby("decile").agg(
         total_premium=(quote_col, "sum"),
         total_loss=("actual_loss", "sum"),
-    )
-    lr_by_decile["loss_ratio"] = lr_by_decile["total_loss"] / lr_by_decile["total_premium"]
-    print(f"\n{model_name} — Loss Ratio by Quote Decile:")
-    print(lr_by_decile[["loss_ratio"]].to_string())
+        policy_count=("actual_loss", "count"),
+    ).reset_index()
+    grouped["loss_ratio"] = grouped["total_loss"] / grouped["total_premium"]
+    grouped["model"] = model_name
+    lr_rows.append(grouped)
+
+lr_all = pd.concat(lr_rows)
+spark.createDataFrame(lr_all).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.loss_ratio_by_decile")
+
+# Visualise
+fig, ax = plt.subplots(figsize=(10, 5))
+for model, color in [("Standard", "#E53935"), ("Enriched", "#43A047")]:
+    subset = lr_all[lr_all["model"] == model]
+    ax.plot(subset["decile"], subset["loss_ratio"], marker="o", label=model, color=color, linewidth=2)
+ax.axhline(y=1.0, color="grey", linestyle="--", alpha=0.5, label="Breakeven (LR=1)")
+ax.set_xlabel("Premium Decile (cheapest → most expensive)")
+ax.set_ylabel("Loss Ratio")
+ax.set_title("Loss Ratio by Quote Decile — Standard vs Enriched")
+ax.legend()
+plt.tight_layout()
+plt.show()
 
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 11. Summary Coefficient Table
+# MAGIC ## 12. Coefficient Comparison
 
 # COMMAND ----------
 
-coef_m1 = m1_freq["model"].summary2().tables[1].reset_index()
-coef_m1.columns = ["Feature", "Coef", "StdErr", "z", "P>|z|", "CI_low", "CI_high"]
-coef_m1["Model"] = "Standard"
+coef_m1 = m1["model"].summary2().tables[1].reset_index()
+coef_m1.columns = ["feature", "coef", "std_err", "z", "p_value", "ci_low", "ci_high"]
+coef_m1["model"] = "standard"
 
-coef_m2 = m2_freq["model"].summary2().tables[1].reset_index()
-coef_m2.columns = ["Feature", "Coef", "StdErr", "z", "P>|z|", "CI_low", "CI_high"]
-coef_m2["Model"] = "Enriched"
+coef_m2 = m2["model"].summary2().tables[1].reset_index()
+coef_m2.columns = ["feature", "coef", "std_err", "z", "p_value", "ci_low", "ci_high"]
+coef_m2["model"] = "enriched"
 
 coef_all = pd.concat([coef_m1, coef_m2])
-display(spark.createDataFrame(coef_all))
+spark.createDataFrame(coef_all).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.glm_coefficients")
+display(spark.table(f"{CATALOG}.{SCHEMA}.glm_coefficients"))
 
 # COMMAND ----------
 
 # MAGIC %md
+# MAGIC ## Summary of Persisted Artefacts
+# MAGIC
+# MAGIC | Artefact | Location |
+# MAGIC |---|---|
+# MAGIC | Raw portfolio | `lr_serverless_aws_us_catalog.pricing_new_data_impact.portfolio` |
+# MAGIC | Train set | `lr_serverless_aws_us_catalog.pricing_new_data_impact.train_set` |
+# MAGIC | Test set | `lr_serverless_aws_us_catalog.pricing_new_data_impact.test_set` |
+# MAGIC | Priced portfolio | `lr_serverless_aws_us_catalog.pricing_new_data_impact.priced_portfolio` |
+# MAGIC | Model comparison | `lr_serverless_aws_us_catalog.pricing_new_data_impact.model_comparison` |
+# MAGIC | Loss ratios | `lr_serverless_aws_us_catalog.pricing_new_data_impact.loss_ratio_by_decile` |
+# MAGIC | GLM coefficients | `lr_serverless_aws_us_catalog.pricing_new_data_impact.glm_coefficients` |
+# MAGIC | Model 1 (Standard) | `lr_serverless_aws_us_catalog.pricing_new_data_impact.glm_frequency_standard` |
+# MAGIC | Model 2 (Enriched) | `lr_serverless_aws_us_catalog.pricing_new_data_impact.glm_frequency_enriched` |
+# MAGIC
+# MAGIC ---
+# MAGIC
 # MAGIC ## Key Takeaways
 # MAGIC
 # MAGIC | Dimension | Model 1 (Standard) | Model 2 (Enriched) | Verdict |
