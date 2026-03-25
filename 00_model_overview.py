@@ -206,6 +206,8 @@
 # MAGIC | Severity feature importance | `.severity_feature_importance` |
 # MAGIC | Severity priced portfolio (freq×sev) | `.severity_priced_portfolio` |
 # MAGIC | Severity loss ratios | `.severity_loss_ratio_by_decile` |
+# MAGIC | Model factory — all 50 results | `.model_factory_results` |
+# MAGIC | Model factory — feature impact | `.model_factory_feature_impact` |
 
 # COMMAND ----------
 
@@ -221,3 +223,4 @@
 # MAGIC | **04_severity_gbm_demo** | Data scientists | Trains both severity GBMs, generates full freq×sev quotes |
 # MAGIC | **05_severity_demo_standard** | Data scientists | Severity walkthrough with feature importance and loss ratios |
 # MAGIC | **06_severity_demo_eli5** | Non-technical stakeholders | Severity results explained in plain English with glossary |
+# MAGIC | **07_model_factory** | Actuaries | Trains 50 GLM specs, ranks by AIC/Gini, elbow charts — "what Radar does, at scale" |
