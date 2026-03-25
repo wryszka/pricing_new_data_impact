@@ -268,7 +268,7 @@
 # MAGIC | Artefact | Table | Created by |
 # MAGIC |---|---|---|
 # MAGIC | Governance summary | `.model_governance_summary` | 04 |
-# MAGIC | PDF report | `/tmp/model_governance_report.pdf` | 04 |
+# MAGIC | PDF report | Volume: `.reports/model_governance_report_<date>.pdf` | 04 |
 # MAGIC
 # MAGIC ### Registered MLflow Models
 # MAGIC
@@ -288,7 +288,8 @@
 # MAGIC | **01** | `build_all_models` | Run once | Generates data, trains freq GLMs + sev GBMs + 50-model factory, persists all to UC | **Run first** |
 # MAGIC | **02** | `results_technical` | Data scientists, actuaries | Full technical walkthrough — metrics, coefficients, feature importance, model factory charts, model serving | After 01 |
 # MAGIC | **03** | `results_executive` | Business stakeholders | Plain-English walkthrough — same data, no jargon, with glossary | After 01 |
-# MAGIC | **04** | `governance_and_review` | Governance, actuaries | Model governance report, PDF export, and interactive AI review agent | After 01 |
+# MAGIC | **04** | `model_governance` | Governance / regulatory | Model governance report with PDF export to UC volume | After 01 |
+# MAGIC | **05** | `model_review_agent` | Actuaries | Interactive AI agent for model Q&A — powered by Foundation Model API | After 01 |
 # MAGIC
 # MAGIC ### Additional Assets
 # MAGIC
@@ -306,8 +307,9 @@
 # MAGIC 1. Start with **00** (this notebook) for context
 # MAGIC 2. Walk through **01** to show the pipeline
 # MAGIC 3. Open **02** for the deep dive — coefficients, feature importance, model factory elbow chart
-# MAGIC 4. Show **04** for governance — the PDF report and interactive agent
-# MAGIC 5. End with the **Genie room** — "ask it anything about the models"
+# MAGIC 4. Show **04** for governance — the PDF report
+# MAGIC 5. Demo **05** — the interactive review agent
+# MAGIC 6. End with the **Genie room** — "ask it anything about the models"
 # MAGIC
 # MAGIC ### For a business audience (underwriters, executives)
 # MAGIC 1. Start with **03** — the full story in plain English
@@ -316,6 +318,6 @@
 # MAGIC
 # MAGIC ### For a governance/regulatory audience
 # MAGIC 1. Start with **00** for the technical specification
-# MAGIC 2. Open **04** — walk through the governance report
-# MAGIC 3. Generate and download the **PDF report**
-# MAGIC 4. Demo the **review agent** — show it answering "what if" questions
+# MAGIC 2. Open **04** — walk through the governance report and generate the PDF
+# MAGIC 3. Download the PDF from Catalog Explorer > Volumes > reports
+# MAGIC 4. Open **05** — demo the review agent answering "what if" questions
