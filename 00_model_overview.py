@@ -208,6 +208,7 @@
 # MAGIC | Severity loss ratios | `.severity_loss_ratio_by_decile` |
 # MAGIC | Model factory — all 50 results | `.model_factory_results` |
 # MAGIC | Model factory — feature impact | `.model_factory_feature_impact` |
+# MAGIC | Model governance summary | `.model_governance_summary` |
 
 # COMMAND ----------
 
@@ -224,3 +225,5 @@
 # MAGIC | **05_severity_demo_standard** | Data scientists | Severity walkthrough with feature importance and loss ratios |
 # MAGIC | **06_severity_demo_eli5** | Non-technical stakeholders | Severity results explained in plain English with glossary |
 # MAGIC | **07_model_factory** | Actuaries | Trains 50 GLM specs, ranks by AIC/Gini, elbow charts — "what Radar does, at scale" |
+# MAGIC | **08_model_governance_report** | Governance / regulatory | Exportable model governance report — inventory, rationale, evidence, sign-off |
+# MAGIC | **09_model_review_agent** | Actuaries | AI agent for interactive model Q&A — powered by Foundation Model API |
