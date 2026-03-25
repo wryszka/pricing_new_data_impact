@@ -113,17 +113,58 @@
 # MAGIC ```
 # MAGIC 1. Data Generation     → 50,000 synthetic home policies
 # MAGIC 2. Train/Test Split    → 70/30 stratified split
-# MAGIC 3. Frequency GLM       → Poisson GLM for claim counts (this project)
-# MAGIC 4. Quote Generation    → predicted_frequency × avg_severity × expense_load (1.35)
-# MAGIC 5. Evaluation          → AIC, BIC, Gini, MAE, RMSE, lift charts, loss ratios
-# MAGIC 6. Persistence         → All artefacts saved to Unity Catalog + MLflow
+# MAGIC 3. Frequency GLM       → Poisson GLM for claim counts
+# MAGIC 4. Severity GBM        → LightGBM with Gamma objective for claim costs (claimants only)
+# MAGIC 5. Quote Generation    → predicted_frequency × predicted_severity × expense_load (1.35)
+# MAGIC 6. Evaluation          → AIC, BIC, Gini, MAE, RMSE, MAPE, lift charts, loss ratios
+# MAGIC 7. Persistence         → All artefacts saved to Unity Catalog + MLflow (frequency models)
 # MAGIC ```
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ## Severity Model: LightGBM with Gamma Objective
 # MAGIC
-# MAGIC ### Note on Severity
+# MAGIC The severity component predicts **how much a claim will cost**, conditional on a claim
+# MAGIC having occurred. It uses the same standard-vs-enriched feature comparison as frequency.
 # MAGIC
-# MAGIC This project currently models **frequency only**. Severity (claim cost given a claim
-# MAGIC has occurred) is approximated using the portfolio average. A dedicated severity model
-# MAGIC would be the natural next step — see the discussion below.
+# MAGIC | Property | Value |
+# MAGIC |---|---|
+# MAGIC | **Algorithm** | LightGBM (Gradient Boosted Machine) |
+# MAGIC | **Objective** | Gamma — for strictly positive, right-skewed data |
+# MAGIC | **Metric** | Gamma deviance |
+# MAGIC | **Target variable** | `claim_severity` — cost per claim (£) |
+# MAGIC | **Training population** | Claimants only (policies with `num_claims > 0`) |
+# MAGIC | **Early stopping** | 50 rounds patience on validation gamma deviance |
+# MAGIC
+# MAGIC ### Why GBM for Severity?
+# MAGIC
+# MAGIC - **Non-linear interactions** — flood zone 4 + subsidence together is disproportionately
+# MAGIC   expensive; a GBM captures these interactions naturally without manual feature engineering
+# MAGIC - **Handles heterogeneity** — claim costs vary enormously (a burst pipe vs. full subsidence
+# MAGIC   repair); GBMs handle this heavy-tailed distribution better than linear models
+# MAGIC - **Complementary to GLM** — using GLM for frequency (transparent, regulatory-friendly) and
+# MAGIC   GBM for severity (captures complex cost patterns) is a common actuarial approach
+# MAGIC
+# MAGIC ### GBM Hyperparameters
+# MAGIC
+# MAGIC | Parameter | Value | Rationale |
+# MAGIC |---|---|---|
+# MAGIC | `learning_rate` | 0.05 | Conservative; avoids overfitting on relatively small claimant population |
+# MAGIC | `num_leaves` | 31 | Default; balanced complexity |
+# MAGIC | `min_child_samples` | 50 | Prevents overfitting on rare segments |
+# MAGIC | `subsample` | 0.8 | Row sampling for regularisation |
+# MAGIC | `colsample_bytree` | 0.8 | Feature sampling for regularisation |
+# MAGIC | `num_boost_round` | Up to 500 | Capped; early stopping triggers before this |
+# MAGIC
+# MAGIC ### Combined Pricing
+# MAGIC
+# MAGIC The full burning-cost quote combines both models:
+# MAGIC
+# MAGIC > **Quote = Predicted Frequency × Predicted Severity × Expense Load (1.35)**
+# MAGIC
+# MAGIC This replaces the flat portfolio-average severity used in notebooks 01–03, giving
+# MAGIC risk-differentiated severity that properly prices expensive perils like flood and subsidence.
 
 # COMMAND ----------
 
@@ -138,6 +179,7 @@
 # MAGIC | **Gini Coefficient** | Risk discrimination — ability to rank policies by risk | Higher is better |
 # MAGIC | **MAE** | Average absolute prediction error | Lower is better |
 # MAGIC | **RMSE** | Like MAE but penalises large errors more | Lower is better |
+# MAGIC | **MAPE** | Prediction error as a percentage (severity) | Lower is better |
 # MAGIC | **Loss Ratio by Decile** | Premium adequacy across risk segments | Stable around 1.0 |
 
 # COMMAND ----------
@@ -158,6 +200,12 @@
 # MAGIC | GLM coefficients | `.glm_coefficients` |
 # MAGIC | Frequency model — Standard | MLflow: `.glm_frequency_standard` |
 # MAGIC | Frequency model — Enriched | MLflow: `.glm_frequency_enriched` |
+# MAGIC | Severity train set | `.severity_train_set` |
+# MAGIC | Severity test set | `.severity_test_set` |
+# MAGIC | Severity model comparison | `.severity_model_comparison` |
+# MAGIC | Severity feature importance | `.severity_feature_importance` |
+# MAGIC | Severity priced portfolio (freq×sev) | `.severity_priced_portfolio` |
+# MAGIC | Severity loss ratios | `.severity_loss_ratio_by_decile` |
 
 # COMMAND ----------
 
@@ -167,6 +215,9 @@
 # MAGIC | Notebook | Audience | Description |
 # MAGIC |---|---|---|
 # MAGIC | **00_model_overview** | Everyone | This notebook — project and model documentation |
-# MAGIC | **01_new_data_impact_demo** | Data scientists | Generates data, trains both GLMs, persists all artefacts |
-# MAGIC | **02_demo_run_standard** | Data scientists | Walkthrough of results with charts and coefficient analysis |
-# MAGIC | **03_demo_run_eli5** | Non-technical stakeholders | Same results, explained in plain English with glossary |
+# MAGIC | **01_new_data_impact_demo** | Data scientists | Generates data, trains both frequency GLMs, persists all artefacts |
+# MAGIC | **02_demo_run_standard** | Data scientists | Frequency walkthrough with charts and coefficient analysis |
+# MAGIC | **03_demo_run_eli5** | Non-technical stakeholders | Frequency results explained in plain English with glossary |
+# MAGIC | **04_severity_gbm_demo** | Data scientists | Trains both severity GBMs, generates full freq×sev quotes |
+# MAGIC | **05_severity_demo_standard** | Data scientists | Severity walkthrough with feature importance and loss ratios |
+# MAGIC | **06_severity_demo_eli5** | Non-technical stakeholders | Severity results explained in plain English with glossary |
