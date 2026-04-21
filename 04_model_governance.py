@@ -98,7 +98,9 @@ print()
 def categorise_spec(name):
     if name == "baseline_standard":
         return "Baseline (standard only)"
-    elif name.startswith("standard_plus_") and name.count("_") <= 4:
+    elif name == "standard_plus_region":
+        return "Standard + region dummies only"
+    elif name.startswith("standard_plus_") and name.count("_") <= 3:
         return "Standard + 1 enrichment feature"
     elif name.startswith("standard_plus_"):
         return "Standard + 2 enrichment features"
@@ -106,8 +108,10 @@ def categorise_spec(name):
         return "Standard + 3 enrichment features"
     elif name.startswith("enrich_4"):
         return "Standard + 4 enrichment features"
-    elif name == "full_enrichment":
-        return "Standard + all 5 enrichment features"
+    elif name == "full_enrichment_no_region":
+        return "Standard + all enrichment features (no region)"
+    elif name == "full_enrichment_with_region":
+        return "Standard + all enrichment features (with region)"
     elif name.startswith("full_plus_"):
         return "Full enrichment + 1 interaction"
     elif name.startswith("full_ix_"):
@@ -356,27 +360,80 @@ FEATURE_RATIONALE = {
         "Tenanted properties exhibit higher claim frequency in most home insurance portfolios, "
         "attributed to differences in care of the property and incentive alignment with the insurer."
     ),
-    "flood_risk_zone": (
-        "Flood risk zone (1–4, low to high) derived from Environmental Agency data. "
-        "Properties in higher flood zones have materially elevated claim frequency for "
-        "escape of water and structural damage events."
+    "imd_decile": (
+        "Index of Multiple Deprivation (England, 2019), LSOA-level overall decile. "
+        "Decile 1 = most deprived, 10 = least deprived. Lower deciles are associated with "
+        "higher claim frequency (theft, escape of water, accidental damage) via correlates of "
+        "housing quality and security. A negative coefficient (lower decile -> higher log-frequency) is expected."
     ),
-    "crime_index": (
-        "Area-level crime index (0–100). Higher crime areas are associated with greater "
-        "frequency of theft, accidental damage, and malicious damage claims."
+    "imd_score": (
+        "Underlying IMD 2019 composite score (continuous). Captures the same deprivation signal "
+        "as imd_decile at finer granularity. Typically strongly correlated with imd_decile; "
+        "expected direction: higher score (more deprived) -> higher claim frequency."
     ),
-    "distance_fire_station_km": (
-        "Distance to the nearest fire station in kilometres. Greater distances increase "
-        "fire claim severity and may increase frequency for properties where delayed response "
-        "leads to greater secondary damage."
+    "crime_decile": (
+        "Crime domain of the IMD 2019 at LSOA level. Decile 1 = most crime-deprived neighbourhoods. "
+        "Strong predictor of theft and malicious damage claim frequency and, to a lesser extent, "
+        "severity. Negative coefficient expected."
     ),
-    "annual_rainfall_mm": (
-        "Average annual rainfall at the property location (mm). Higher rainfall increases "
-        "subsidence risk from ground movement, escape of water frequency, and storm damage."
+    "income_decile": (
+        "Income deprivation decile (IMD 2019). Correlates with many downstream risk factors "
+        "including housing quality, occupancy patterns, and prior-claim behaviour. "
+        "Negative coefficient expected."
     ),
-    "subsidence_risk": (
-        "Binary indicator of properties located on subsidence-prone ground (clay, chalk). "
-        "Strong predictor of structural claims; materially significant in London and the South East."
+    "health_decile": (
+        "Health deprivation and disability decile (IMD 2019). Acts as a weak positive correlate of "
+        "escape-of-water and accidental-damage claims through occupancy and care patterns. "
+        "Coefficient is typically modest and may be partially absorbed by imd_decile."
+    ),
+    "living_env_decile": (
+        "Living environment deprivation decile (IMD 2019) — captures housing condition, "
+        "air quality, and road safety. Strong predictor of maintenance-related claims "
+        "(escape of water, subsidence precursors). Negative coefficient expected."
+    ),
+    "is_urban": (
+        "Urban/rural indicator derived from the ONS 2011 Rural-Urban Classification "
+        "(urban = A1/B1/C1/C2 bands at LSOA level). Urban properties exhibit higher claim frequency "
+        "for theft and escape of water. Positive coefficient expected."
+    ),
+    "is_coastal": (
+        "Coastal flag derived from coastal English local authorities. Coastal properties experience "
+        "elevated weather-related and water-ingress claims (storm, salt corrosion). "
+        "Positive coefficient expected for both frequency and severity."
+    ),
+    "region_east_of_england": (
+        "ONS Region dummy. Regional geographic effect relative to the baseline region "
+        "(typically East Midlands). Captures residual geographic heterogeneity after IMD "
+        "and urban/coastal controls."
+    ),
+    "region_london": (
+        "ONS Region dummy (London). London typically shows elevated claim frequency "
+        "(theft, escape of water) relative to the baseline region."
+    ),
+    "region_north_east": (
+        "ONS Region dummy (North East). Captures residual regional effect after deprivation "
+        "and urban/coastal controls."
+    ),
+    "region_north_west": (
+        "ONS Region dummy (North West). Typically shows elevated frequency relative to the baseline, "
+        "driven by weather exposure and housing stock composition."
+    ),
+    "region_south_east": (
+        "ONS Region dummy (South East). Regional effect beyond deprivation and coastal controls."
+    ),
+    "region_south_west": (
+        "ONS Region dummy (South West). Weather-exposed coastal geography tends to lift frequency "
+        "relative to the baseline region."
+    ),
+    "": (
+        "ONS Region dummy (Wales). Captures residual regional effect; note Welsh IMD is not "
+        "directly comparable to English IMD 2019, so the dummy carries additional signal."
+    ),
+    "region_west_midlands": (
+        "ONS Region dummy (West Midlands). Regional geographic effect relative to the baseline region."
+    ),
+    "region_yorkshire": (
+        "ONS Region dummy (Yorkshire and The Humber). Regional geographic effect relative to the baseline region."
     ),
 }
 
@@ -436,11 +493,11 @@ ax.set_title(
 ax.grid(axis="x", alpha=0.3)
 
 enrichment_features = [
-    "flood_risk_zone", "crime_index", "distance_fire_station_km",
-    "annual_rainfall_mm", "subsidence_risk"
+    "imd_decile", "imd_score", "crime_decile", "income_decile",
+    "health_decile", "living_env_decile", "is_urban", "is_coastal",
 ]
 for i, feat in enumerate(plot_df["feature"]):
-    if feat in enrichment_features:
+    if feat in enrichment_features or (feat.startswith("region_") and feat != "region_code"):
         ax.get_yticklabels()[i].set_color("#6A1B9A")
         ax.get_yticklabels()[i].set_fontweight("bold")
 
@@ -645,8 +702,8 @@ ax.grid(axis="x", alpha=0.3)
 
 ax = axes[1]
 enrichment_features_list = [
-    "flood_risk_zone", "crime_index", "distance_fire_station_km",
-    "annual_rainfall_mm", "subsidence_risk"
+    "imd_decile", "crime_decile", "income_decile", "health_decile",
+    "living_env_decile", "is_urban", "is_coastal",
 ]
 comparison_data = []
 for ef in enrichment_features_list:
@@ -708,40 +765,47 @@ print(f"  This represents a material reduction in model quality that would requi
 # MAGIC
 # MAGIC | Attribute | Detail |
 # MAGIC |---|---|
-# MAGIC | **Data type** | Fully synthetic — generated programmatically in notebook `01_new_data_impact_demo.py` |
-# MAGIC | **Sample size** | 50,000 simulated home insurance policies |
+# MAGIC | **Policy & claim records** | Synthetic — generated programmatically in notebook `01_build_all_models.py` |
+# MAGIC | **Enrichment features** | **Real UK public data** — ONSPD postcode directory, MHCLG IMD 2019 (LSOA deciles), ONS 2011 Rural-Urban Classification, coastal local-authority derivation |
+# MAGIC | **Sample size** | 50,000 simulated home insurance policies, each keyed to a real UK postcode |
 # MAGIC | **Train/test split** | 70% / 30% random split (seed = 42) |
 # MAGIC | **Policy period** | Single-period; no longitudinal dimension |
 # MAGIC
 # MAGIC ## 7.2 Known Assumptions
 # MAGIC
-# MAGIC 1. **Synthetic data:** All policy records, claims, and enrichment variables are simulated.
-# MAGIC    Results should **not** be treated as reflective of real portfolio behaviour.
+# MAGIC 1. **Synthetic policies and claims:** Policyholders, properties, and claim outcomes are simulated.
+# MAGIC    The enrichment features attached to each policy are real (IMD 2019, ONSPD, ONS RUC), but the
+# MAGIC    claim-generating process is modelled and not reflective of a real portfolio.
 # MAGIC
-# MAGIC 2. **No temporal effects:** The dataset represents a single cross-sectional snapshot.
+# MAGIC 2. **No temporal effects:** The dataset represents a single cross-sectional snapshot. IMD 2019
+# MAGIC    deprivation inputs are also a single-vintage snapshot; they do not track deprivation change over time.
 # MAGIC
-# MAGIC 3. **No spatial autocorrelation:** Enrichment variables are drawn independently per policy.
+# MAGIC 3. **Spatial smoothing at LSOA level:** IMD deciles are constant within an LSOA, so within-LSOA
+# MAGIC    heterogeneity in risk is not captured by these features.
 # MAGIC
 # MAGIC 4. **Exposure homogeneity:** All policies are assumed to carry a single year of exposure.
 # MAGIC
-# MAGIC 5. **Linear enrichment effects:** Non-linearities (e.g., threshold effects in flood zones)
-# MAGIC    are not captured by the current GLM structure.
+# MAGIC 5. **Linear enrichment effects:** Non-linearities (e.g., threshold effects in deprivation deciles)
+# MAGIC    are not captured by the current GLM structure; deciles are treated as ordinal-continuous.
 # MAGIC
 # MAGIC 6. **No interaction structure beyond the factory:** Interactions were limited to pre-specified
 # MAGIC    combinations; a full interaction search was not performed.
 # MAGIC
 # MAGIC 7. **Severity independence:** The frequency and severity models are fitted independently.
 # MAGIC
-# MAGIC 8. **Regulatory permissibility:** Use of enrichment variables in real pricing models
-# MAGIC    requires regulatory review under applicable rules (e.g., FCA GIPP, Equality Act 2010, GDPR).
+# MAGIC 8. **Regulatory permissibility:** Use of area-level deprivation and postcode-derived features in
+# MAGIC    real pricing models requires regulatory review under applicable rules (e.g., FCA GIPP,
+# MAGIC    Equality Act 2010, GDPR). Deprivation indices can act as proxies for protected characteristics
+# MAGIC    and must be documented and justified accordingly.
 # MAGIC
 # MAGIC ## 7.3 Data Quality Flags
 # MAGIC
 # MAGIC | Flag | Description | Impact |
 # MAGIC |---|---|---|
-# MAGIC | Synthetic origin | Data is simulated, not observed | Results not generalisable to real portfolios |
-# MAGIC | No missing values | Simulation produces complete data | Imputation robustness untested |
-# MAGIC | Uncorrelated enrichment | Enrichment features sampled independently | May understate collinearity risks in real data |
+# MAGIC | Synthetic claims | Claim frequency and severity are simulated | Results not generalisable to real portfolio behaviour |
+# MAGIC | Real public enrichment | IMD 2019, ONSPD, and RUC are real UK public datasets | Collinearity between deprivation deciles present and must be monitored |
+# MAGIC | LSOA granularity | Enrichment deciles are constant within each LSOA | Within-LSOA risk variation not captured |
+# MAGIC | England-only IMD | IMD 2019 coverage is English LSOAs | Welsh / Scottish / NI postcodes rely on region effects; not directly comparable |
 # MAGIC | No premium loading | Quotes use a fixed expense load | Real pricing requires bespoke expense and profit loads |
 
 # COMMAND ----------
@@ -773,8 +837,8 @@ governance_records.append({
     "specifications_searched": n_models,
     "train_size": int(spark.table("train_set").count()),
     "test_size": int(spark.table("test_set").count()),
-    "data_type": "Synthetic",
-    "known_limitations": "Synthetic data; no temporal/spatial effects; single exposure period",
+    "data_type": "Synthetic policies & claims; real UK public enrichment (IMD 2019, ONSPD, ONS RUC)",
+    "known_limitations": "Synthetic claim process; LSOA-level enrichment granularity; single exposure period; no temporal dynamics",
     "status": "DRAFT - Pending Review",
 })
 
@@ -796,8 +860,8 @@ governance_records.append({
     "specifications_searched": n_models,
     "train_size": int(spark.table("train_set").count()),
     "test_size": int(spark.table("test_set").count()),
-    "data_type": "Synthetic",
-    "known_limitations": "Synthetic data; no temporal/spatial effects; single exposure period",
+    "data_type": "Synthetic policies & claims; real UK public enrichment (IMD 2019, ONSPD, ONS RUC)",
+    "known_limitations": "Synthetic claim process; LSOA-level enrichment granularity; single exposure period; no temporal dynamics",
     "status": "REFERENCE — Not for deployment",
 })
 
@@ -831,8 +895,8 @@ for sev_label, mae_val, r2_val in [
         "specifications_searched": 2,
         "train_size": int(spark.table("train_set").count()),
         "test_size": int(spark.table("test_set").count()),
-        "data_type": "Synthetic",
-        "known_limitations": "Synthetic data; severity modelled on claimants only; exposure not adjusted",
+        "data_type": "Synthetic policies & claims; real UK public enrichment (IMD 2019, ONSPD, ONS RUC)",
+        "known_limitations": "Synthetic claim process; severity modelled on claimants only; exposure not adjusted",
         "status": "DRAFT - Pending Review",
     })
 
@@ -919,11 +983,12 @@ report_lines += [
     "",
     "SECTION 6 — DATA QUALITY & LIMITATIONS",
     "-" * 40,
-    "  - Data is fully synthetic (not real portfolio data)",
-    "  - 50,000 simulated home insurance policies",
-    "  - No temporal, spatial, or exposure-weighted effects modelled",
-    "  - Enrichment variables sampled independently (no spatial autocorrelation)",
-    "  - Regulatory permissibility of enrichment features not assessed",
+    "  - Policies and claims are synthetic (not real portfolio experience)",
+    "  - Enrichment features are REAL UK public data: IMD 2019 (MHCLG), ONSPD (ONS), ONS RUC 2011",
+    "  - 50,000 simulated home insurance policies keyed to real UK postcodes",
+    "  - No temporal or exposure-weighted effects modelled",
+    "  - Enrichment deciles constant within LSOA (spatial granularity limit)",
+    "  - Regulatory permissibility of deprivation-based features requires review (FCA GIPP, Equality Act, GDPR)",
     "",
     "SECTION 7 — ARTEFACTS PERSISTED TO UNITY CATALOG",
     "-" * 40,
@@ -1258,7 +1323,13 @@ pdf.ln(3)
 feat_rows = []
 for _, row in coef_enriched.sort_values("coef", ascending=False).iterrows():
     feat_name = row["feature"]
-    is_enrich = feat_name in ["flood_risk_zone", "crime_index", "distance_fire_station_km", "annual_rainfall_mm", "subsidence_risk"]
+    is_enrich = (
+        feat_name in [
+            "imd_decile", "imd_score", "crime_decile", "income_decile",
+            "health_decile", "living_env_decile", "is_urban", "is_coastal",
+        ]
+        or (feat_name.startswith("region_") and feat_name != "region_code")
+    )
     label = f"(*) {feat_name}" if is_enrich else feat_name
     # Truncate rationale for table
     rationale = FEATURE_RATIONALE.get(feat_name, "")
@@ -1420,10 +1491,11 @@ pdf.section_heading("Section 6 — Data Quality & Limitations")
 
 pdf.section_heading("6.1  Data Source", level=2)
 datasource_rows = [
-    ["Data type",        "Fully synthetic — generated programmatically"],
-    ["Sample size",      "50,000 simulated home insurance policies"],
-    ["Train/test split", "70% / 30% random split (seed = 42)"],
-    ["Policy period",    "Single-period; no longitudinal dimension"],
+    ["Policies & claims",  "Synthetic — generated programmatically in 01_build_all_models.py"],
+    ["Enrichment features","Real UK public data: IMD 2019 (MHCLG), ONSPD (ONS), ONS RUC 2011, coastal LAs"],
+    ["Sample size",        "50,000 simulated home insurance policies keyed to real UK postcodes"],
+    ["Train/test split",   "70% / 30% random split (seed = 42)"],
+    ["Policy period",      "Single-period; no longitudinal dimension"],
 ]
 pdf.table(
     headers=["Attribute", "Detail"],
@@ -1434,14 +1506,16 @@ pdf.ln(4)
 
 pdf.section_heading("6.2  Known Assumptions & Limitations", level=2)
 limitations = [
-    "Synthetic data: All records are simulated. Results are not reflective of real portfolio behaviour.",
+    "Synthetic policies & claims: Claim process is simulated. Results are illustrative, not indicative of real portfolio behaviour.",
+    "Real enrichment features: IMD 2019, ONSPD, and ONS RUC 2011 are real UK public datasets; collinearity between deprivation deciles is material and must be monitored.",
     "No temporal effects: Single cross-sectional snapshot; no inflation, portfolio drift, or underwriting cycle.",
-    "No spatial autocorrelation: Enrichment variables are drawn independently per policy.",
+    "LSOA granularity: Enrichment deciles are constant within each LSOA; within-LSOA risk variation is not captured.",
+    "England-only IMD: IMD 2019 covers English LSOAs; non-English postcodes rely on region dummies only.",
     "Exposure homogeneity: All policies carry a single year of exposure (no offset term required).",
-    "Linear enrichment effects: Non-linearities (e.g., threshold effects in flood zones) are not captured.",
+    "Linear enrichment effects: Non-linearities (e.g., threshold effects in deprivation deciles) are not captured.",
     "No interaction search: Interactions were limited to pre-specified combinations only.",
     "Severity independence: Frequency and severity models are fitted independently (two-part model).",
-    "Regulatory permissibility: Use of enrichment variables requires regulatory review (FCA GIPP, Equality Act, GDPR).",
+    "Regulatory permissibility: Deprivation-based and postcode-derived features require regulatory review (FCA GIPP, Equality Act, GDPR) as they may proxy for protected characteristics.",
     "GLM over-dispersion: The Poisson family assumes mean = variance; over-dispersion untested.",
     "LightGBM severity: May overfit on small claim sub-populations.",
 ]
@@ -1451,9 +1525,10 @@ for lim in limitations:
 pdf.ln(4)
 pdf.section_heading("6.3  Data Quality Flags", level=2)
 dq_rows = [
-    ["Synthetic origin",       "Data is simulated, not observed",                       "Results not generalisable to real portfolios"],
-    ["No missing values",      "Simulation produces complete data",                     "Imputation robustness untested"],
-    ["Uncorrelated enrichment","Enrichment features sampled independently",              "May understate collinearity risks in real data"],
+    ["Synthetic claims",       "Claim frequency/severity are simulated",                "Results not generalisable to real portfolios"],
+    ["Real public enrichment", "IMD 2019, ONSPD, ONS RUC 2011 are real UK public data", "Collinearity between deprivation deciles must be monitored"],
+    ["LSOA granularity",       "Enrichment deciles constant within each LSOA",          "Within-LSOA risk variation not captured"],
+    ["England-only IMD",       "IMD 2019 covers English LSOAs",                         "Welsh/Scottish/NI postcodes rely on region dummies only"],
     ["No premium loading",     "Quotes use a fixed expense load",                       "Real pricing requires bespoke expense/profit loads"],
 ]
 pdf.table(

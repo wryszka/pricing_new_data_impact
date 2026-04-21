@@ -6,8 +6,9 @@
 # MAGIC
 # MAGIC This notebook consolidates the full technical results of the new data impact study:
 # MAGIC comparing **standard GLM/GBM** (traditional rating factors only) against **enriched GLM/GBM**
-# MAGIC (augmented with external data: flood risk, crime index, subsidence, distance to fire station,
-# MAGIC annual rainfall).
+# MAGIC (augmented with real UK public data: IMD 2019 deprivation deciles — overall, crime, income,
+# MAGIC health, living environment — plus urban/rural, coastal flag, and region dummies, all joined
+# MAGIC on the policy's postcode via the `postcode_enrichment` table).
 # MAGIC
 # MAGIC All artefacts — portfolios, coefficients, model metrics, scored quotes, and model factory
 # MAGIC results — are read directly from Unity Catalog. This notebook trains nothing.
@@ -69,8 +70,8 @@ print(f"Schema  : {SCHEMA}")
 
 # COMMAND ----------
 
-portfolio = spark.table("portfolio")
-pdf = portfolio.toPandas()
+# Use spark.sql to work around Photon column-index bug on the portfolio schema
+pdf = spark.sql(f"SELECT * FROM {CATALOG}.{SCHEMA}.portfolio").toPandas()
 
 n_policies = len(pdf)
 claim_rate = (pdf["num_claims"] > 0).mean()
@@ -85,7 +86,7 @@ print(f"Avg severity:    £{avg_severity:,.0f}")
 # Distribution of key features
 fig, axes = plt.subplots(1, 3, figsize=(14, 4))
 
-feature_cols = [c for c in ["property_type", "flood_risk_zone", "construction"] if c in pdf.columns][:3]
+feature_cols = [c for c in ["property_type", "imd_decile", "region_name"] if c in pdf.columns][:3]
 for ax, col in zip(axes, feature_cols):
     pdf[col].value_counts().sort_index().plot.bar(ax=ax, edgecolor="white")
     ax.set_title(col.replace("_", " ").title())
@@ -101,8 +102,9 @@ plt.show()
 # MAGIC ## 3. Frequency Model Comparison
 # MAGIC
 # MAGIC Comparing a Poisson GLM trained on standard rating factors only against the same
-# MAGIC GLM augmented with five enrichment features.  Lower AIC/BIC = better fit.
-# MAGIC Higher Gini and Deviance Explained = stronger risk discrimination.
+# MAGIC GLM augmented with the real UK public-data enrichment features (IMD deciles, urban,
+# MAGIC coastal, region). Lower AIC/BIC = better fit. Higher Gini and Deviance Explained
+# MAGIC = stronger risk discrimination.
 
 # COMMAND ----------
 
@@ -143,8 +145,11 @@ display(spark.createDataFrame(pivot.reset_index()))
 # COMMAND ----------
 
 # Enrichment features — statistical significance in the enriched model
-enrichment_features = ["flood_risk_zone", "crime_index", "subsidence_risk",
-                       "distance_fire_station_km", "annual_rainfall_mm"]
+base_enrichment = ["imd_decile", "crime_decile", "income_decile", "health_decile",
+                   "living_env_decile", "is_urban", "is_coastal"]
+region_dummies = [c for c in coefficients["feature"].unique() if str(c).startswith("region_") and c != "region_code"]
+enrichment_features = base_enrichment + region_dummies
+
 enrich_mask = (
     coefficients["feature"].isin(enrichment_features)
     & (coefficients["model"].str.contains("enriched", case=False))
@@ -212,7 +217,7 @@ print(lr_stability.to_string(index=False))
 # MAGIC ## 5. Frequency Pricing Impact
 # MAGIC
 # MAGIC Burning-cost quotes (frequency component) compared across the full portfolio.
-# MAGIC The enriched model re-prices high flood-risk and subsidence-exposed properties materially.
+# MAGIC The enriched model re-prices deprived, high-crime, and coastal postcodes materially.
 
 # COMMAND ----------
 
@@ -227,12 +232,12 @@ print(f"Max decrease:                    £{priced['quote_diff'].min():.2f}")
 
 # COMMAND ----------
 
-# Top 10 most divergent quotes — high flood risk and/or subsidence
+# Top 10 most divergent quotes — high-crime, deprived or coastal postcodes
 high_risk = priced[
-    (priced["flood_risk_zone"] >= 3) | (priced["subsidence_risk"] == 1)
+    (priced["crime_decile"] <= 2) | (priced["imd_decile"] <= 2) | (priced["is_coastal"] == 1)
 ].nlargest(10, "quote_diff")
 
-display(spark.createDataFrame(high_risk[["flood_risk_zone", "subsidence_risk",
+display(spark.createDataFrame(high_risk[["crime_decile", "imd_decile", "is_coastal",
                                          "quote_standard", "quote_enriched", "quote_diff"]]))
 
 # COMMAND ----------
@@ -253,8 +258,8 @@ plt.show()
 
 # COMMAND ----------
 
-# Segmentation — average quotes by flood_risk_zone and subsidence_risk
-seg_cols = [c for c in ["flood_risk_zone", "subsidence_risk"] if c in priced.columns]
+# Segmentation — average quotes by crime_decile, imd_decile and is_coastal
+seg_cols = [c for c in ["crime_decile", "imd_decile", "is_coastal"] if c in priced.columns]
 
 for col in seg_cols:
     seg = priced.groupby(col).agg(
@@ -268,18 +273,19 @@ for col in seg_cols:
 
 # COMMAND ----------
 
-# Bar chart — average frequency quotes by flood_risk_zone
-if "flood_risk_zone" in priced.columns:
-    seg_flood = priced.groupby("flood_risk_zone")[["quote_standard", "quote_enriched"]].mean().sort_index()
+# Bar chart — average frequency quotes by crime_decile
+if "crime_decile" in priced.columns:
+    seg_crime = priced.groupby("crime_decile")[["quote_standard", "quote_enriched"]].mean().sort_index()
     fig, ax = plt.subplots(figsize=(8, 5))
-    x = np.arange(len(seg_flood))
+    x = np.arange(len(seg_crime))
     width = 0.35
-    ax.bar(x - width / 2, seg_flood["quote_standard"], width, label="Standard", color="#4C72B0")
-    ax.bar(x + width / 2, seg_flood["quote_enriched"], width, label="Enriched", color="#DD8452")
+    ax.bar(x - width / 2, seg_crime["quote_standard"], width, label="Standard", color="#4C72B0")
+    ax.bar(x + width / 2, seg_crime["quote_enriched"], width, label="Enriched", color="#DD8452")
     ax.set_xticks(x)
-    ax.set_xticklabels(seg_flood.index, rotation=45, ha="right")
+    ax.set_xticklabels([f"{int(d)}" for d in seg_crime.index], rotation=0)
+    ax.set_xlabel("Crime Decile (1 = highest crime → 10 = lowest)")
     ax.set_ylabel("Average Frequency Quote (£)")
-    ax.set_title("Average Frequency Quote by Flood Risk Zone")
+    ax.set_title("Average Frequency Quote by Crime Decile")
     ax.legend()
     plt.tight_layout()
     plt.show()
@@ -358,7 +364,8 @@ for metric in smc.index:
 # MAGIC ## 7. Severity Feature Importance
 # MAGIC
 # MAGIC Side-by-side feature importance (gain) from the standard and enriched GBMs.
-# MAGIC The enriched model redistributes importance toward flood, subsidence and crime features.
+# MAGIC The enriched model redistributes importance toward the IMD deciles, coastal flag,
+# MAGIC and region dummies.
 
 # COMMAND ----------
 
@@ -382,11 +389,15 @@ plt.show()
 # COMMAND ----------
 
 # Enrichment feature share of total importance in the enriched model
-enr_feat_set = {"flood_risk_zone", "crime_index", "distance_fire_station_km",
-                "annual_rainfall_mm", "subsidence_risk"}
-enr_imp = importance[(importance["model"] == "enriched") & (importance["feature"].isin(enr_feat_set))]
-total_imp = importance[importance["model"] == "enriched"]["importance"].sum()
-enr_share = enr_imp["importance"].sum() / total_imp * 100
+base_enr_feat_set = {"imd_decile", "crime_decile", "income_decile", "health_decile",
+                     "living_env_decile", "is_urban", "is_coastal"}
+enriched_rows = importance[importance["model"] == "enriched"]
+region_feat_set = {f for f in enriched_rows["feature"].unique() if str(f).startswith("region_") and f != "region_code"}
+enr_feat_set = base_enr_feat_set | region_feat_set
+
+enr_imp = enriched_rows[enriched_rows["feature"].isin(enr_feat_set)]
+total_imp = enriched_rows["importance"].sum()
+enr_share = enr_imp["importance"].sum() / total_imp * 100 if total_imp else 0.0
 print(f"Enrichment features account for {enr_share:.1f}% of total importance in the enriched GBM")
 
 # COMMAND ----------
@@ -482,8 +493,8 @@ plt.show()
 
 # COMMAND ----------
 
-# Segmentation — severity by flood_risk_zone and subsidence_risk
-for col, labels in [("flood_risk_zone", None), ("subsidence_risk", {0: "No Risk", 1: "At Risk"})]:
+# Segmentation — severity by imd_decile and is_coastal
+for col, labels in [("imd_decile", None), ("is_coastal", {0: "Inland", 1: "Coastal"})]:
     seg = sev_priced.groupby(col).agg(
         avg_sev_standard=("sev_pred_standard", "mean"),
         avg_sev_enriched=("sev_pred_enriched", "mean"),
@@ -498,27 +509,27 @@ for col, labels in [("flood_risk_zone", None), ("subsidence_risk", {0: "No Risk"
 
 # COMMAND ----------
 
-# Bar chart — predicted severity vs actual by flood risk zone
+# Bar chart — predicted severity vs actual by IMD decile
 fig, ax = plt.subplots(figsize=(10, 6))
 
-seg_flood = sev_priced.groupby("flood_risk_zone").agg(
+seg_imd = sev_priced.groupby("imd_decile").agg(
     standard=("sev_pred_standard", "mean"),
     enriched=("sev_pred_enriched", "mean"),
     actual=("claim_severity", "mean"),
 ).sort_index()
 
-x = np.arange(len(seg_flood))
+x = np.arange(len(seg_imd))
 width = 0.25
 
-ax.bar(x - width, seg_flood["standard"], width, label="Standard GBM", color="#E53935", alpha=0.85)
-ax.bar(x, seg_flood["enriched"], width, label="Enriched GBM", color="#1E88E5", alpha=0.85)
-ax.bar(x + width, seg_flood["actual"], width, label="Actual Avg Severity", color="#43A047", alpha=0.85)
+ax.bar(x - width, seg_imd["standard"], width, label="Standard GBM", color="#E53935", alpha=0.85)
+ax.bar(x, seg_imd["enriched"], width, label="Enriched GBM", color="#1E88E5", alpha=0.85)
+ax.bar(x + width, seg_imd["actual"], width, label="Actual Avg Severity", color="#43A047", alpha=0.85)
 
-ax.set_xlabel("Flood Risk Zone (1 = Low → 4 = High)")
+ax.set_xlabel("IMD Decile (1 = most deprived → 10 = least)")
 ax.set_ylabel("Average Severity (£)")
-ax.set_title("Predicted Severity by Flood Risk Zone")
+ax.set_title("Predicted Severity by IMD (Deprivation) Decile")
 ax.set_xticks(x)
-ax.set_xticklabels(seg_flood.index)
+ax.set_xticklabels([f"{int(d)}" for d in seg_imd.index])
 ax.legend()
 ax.grid(axis="y", alpha=0.3)
 plt.tight_layout()
@@ -645,20 +656,30 @@ print(impact_df.to_string(index=False))
 
 # COMMAND ----------
 
-model_uri = f"models:/{CATALOG}.{SCHEMA}.glm_frequency_enriched/1"
+# Load the latest registered version — older versions may have stale feature schemas
+from mlflow.tracking import MlflowClient
+_client = MlflowClient(registry_uri="databricks-uc")
+_uc_model_name = f"{CATALOG}.{SCHEMA}.glm_frequency_enriched"
+_latest = max(int(v.version) for v in _client.search_model_versions(f"name='{_uc_model_name}'"))
+model_uri = f"models:/{_uc_model_name}/{_latest}"
 model = mlflow.pyfunc.load_model(model_uri)
 print(f"Loaded model from {model_uri}")
 
 # Score a small sample
 sample = spark.table("priced_portfolio").limit(5).toPandas()
+
+# Region dummies are discovered dynamically from the table — keeps notebook in sync with notebook 01
+region_features = sorted([c for c in sample.columns if c.startswith("region_") and c != "region_code"])
+
 enriched_features = [
     "building_age", "bedrooms", "sum_insured", "prior_claims", "policy_tenure",
     "property_type_flat", "property_type_semi_detached", "property_type_terraced",
     "construction_other", "construction_stone", "construction_timber",
     "occupancy_tenant",
-    "flood_risk_zone", "crime_index", "distance_fire_station_km",
-    "annual_rainfall_mm", "subsidence_risk",
-]
+    "imd_decile", "crime_decile", "income_decile", "health_decile", "living_env_decile",
+    "is_urban", "is_coastal",
+] + region_features
+
 preds = model.predict(sample[enriched_features].astype(float))
 sample["predicted_frequency"] = preds
 display(spark.createDataFrame(sample[enriched_features[:5] + ["predicted_frequency"]]))
@@ -677,7 +698,7 @@ display(spark.createDataFrame(sample[enriched_features[:5] + ["predicted_frequen
 # MAGIC | Gini coefficient | Baseline | Higher | Stronger risk discrimination |
 # MAGIC | Deviance explained | Baseline | Higher | More variance captured |
 # MAGIC | Loss-ratio stability | Higher σ | Lower σ | More uniform pricing across deciles |
-# MAGIC | Pricing segmentation | Coarse | Granular | Flood, subsidence, crime now priced explicitly |
+# MAGIC | Pricing segmentation | Coarse | Granular | Deprivation, crime, coastal and region now priced explicitly |
 # MAGIC
 # MAGIC ### Severity Model
 # MAGIC
@@ -686,7 +707,7 @@ display(spark.createDataFrame(sample[enriched_features[:5] + ["predicted_frequen
 # MAGIC | MAE | Baseline | Lower | More accurate severity predictions |
 # MAGIC | RMSE | Baseline | Lower | Fewer large prediction errors |
 # MAGIC | Gini | Baseline | Higher | Better severity discrimination |
-# MAGIC | Feature importance | Property-centric | Risk-centric | Flood & subsidence drive severity |
+# MAGIC | Feature importance | Property-centric | Risk-centric | IMD deprivation & coastal drive severity |
 # MAGIC | Loss-ratio stability | Higher σ | Lower σ | More consistent full pricing |
 # MAGIC
 # MAGIC ### Model Factory
@@ -699,11 +720,12 @@ display(spark.createDataFrame(sample[enriched_features[:5] + ["predicted_frequen
 # MAGIC | Best interaction | Varies by portfolio — see feature impact chart |
 # MAGIC | vs Radar / Emblem | 50 models in under a minute vs 5–10 models over hours of analyst time |
 # MAGIC
-# MAGIC **Business impact:** The enriched models enable risk-adequate pricing for perils the
-# MAGIC standard models cannot observe — flood, subsidence, and crime exposure.  This reduces
-# MAGIC adverse selection on high-risk properties and avoids overcharging low-risk ones.
-# MAGIC The combined frequency × severity improvement in Gini and loss-ratio stability
-# MAGIC translates directly to better portfolio profitability and competitive positioning.
+# MAGIC **Business impact:** The enriched models enable risk-adequate pricing for exposures the
+# MAGIC standard models cannot observe — neighbourhood crime, area deprivation, living-environment
+# MAGIC quality, coastal location and regional effects. This reduces adverse selection on high-risk
+# MAGIC postcodes and avoids overcharging low-risk ones. The combined frequency × severity
+# MAGIC improvement in Gini and loss-ratio stability translates directly to better portfolio
+# MAGIC profitability and competitive positioning.
 # MAGIC
 # MAGIC The model factory provides actuaries with a complete picture of the enrichment
 # MAGIC trade-offs across 50 specifications — augmenting judgement rather than replacing it.

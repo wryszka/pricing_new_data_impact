@@ -7,10 +7,32 @@
 # MAGIC with every table, registered model, and evaluation artefact. The walkthrough notebooks
 # MAGIC consume these outputs for presentation.
 # MAGIC
+# MAGIC ## What's different in this version
+# MAGIC
+# MAGIC Instead of generating synthetic enrichment features, we **sample from real UK postcode
+# MAGIC data** (produced by `00a_build_postcode_enrichment`). Every policy in the demo portfolio
+# MAGIC is assigned a real English postcode, and inherits its real enrichment features from
+# MAGIC public UK government data:
+# MAGIC
+# MAGIC | Real feature | Source | Meaning |
+# MAGIC |---|---|---|
+# MAGIC | `imd_decile` | MHCLG IMD 2019 | Overall deprivation decile (1 = most deprived) |
+# MAGIC | `crime_decile` | MHCLG IMD 2019 | Crime deprivation decile |
+# MAGIC | `income_decile` | MHCLG IMD 2019 | Income deprivation decile |
+# MAGIC | `health_decile` | MHCLG IMD 2019 | Health deprivation decile |
+# MAGIC | `living_env_decile` | MHCLG IMD 2019 | Living environment decile |
+# MAGIC | `is_urban` | ONS RUC 2011 | Urban/rural classification |
+# MAGIC | `is_coastal` | Derived from ONS LA codes | Coastal postcode flag |
+# MAGIC
+# MAGIC Policy-level rating factors (property type, construction, age, sum insured) remain
+# MAGIC synthetic — in a real deployment these would come from the insurer's book of business.
+# MAGIC Claims are simulated from the real enrichment features using a DGP calibrated to
+# MAGIC published UK market statistics (~15% claim rate, ~£2,600 average severity).
+# MAGIC
 # MAGIC | Section | What it does |
 # MAGIC |---|---|
 # MAGIC | 1. Setup | pip install, schema creation, MLflow config |
-# MAGIC | 2. Synthetic Portfolio | Generate 50 k home insurance policies |
+# MAGIC | 2. Portfolio Construction | Sample postcodes, generate standard factors, simulate claims |
 # MAGIC | 3. Train/Test Split | 70/30 split, save to UC |
 # MAGIC | 4. Helper Functions | Gini, GLMWrapper, fit_and_log_glm |
 # MAGIC | 5. Frequency GLMs | Train & register standard and enriched Poisson GLMs |
@@ -66,108 +88,237 @@ print(f"Schema  : {SCHEMA}")
 # COMMAND ----------
 
 # MAGIC %md
-# MAGIC ## 2. Generate Synthetic Portfolio
+# MAGIC ## 2. Portfolio Construction
+# MAGIC
+# MAGIC ### 2a. Sample real postcodes from the enrichment table
+# MAGIC
+# MAGIC We draw N postcodes from `postcode_enrichment` (the ~1.3M England postcodes built in
+# MAGIC notebook 00a) weighted by urban density — so the demo portfolio approximately mirrors
+# MAGIC where insured households actually live.
+
+# COMMAND ----------
+
+N = 200_000  # demo portfolio size — real insurers have 500k-2M policies; 200k demonstrates scale
+
+# Verify the enrichment table exists
+try:
+    n_postcodes = spark.table(f"{CATALOG}.{SCHEMA}.postcode_enrichment").count()
+    print(f"postcode_enrichment available: {n_postcodes:,} postcodes")
+except Exception as e:
+    raise RuntimeError(
+        "postcode_enrichment table not found. Run 00a_build_postcode_enrichment first."
+    ) from e
+
+# Sample N postcodes. Urban postcodes get 3x the weight of rural ones to approximate
+# residential insurance density (most insured properties are in towns/cities).
+enrichment_pd = (
+    spark.table(f"{CATALOG}.{SCHEMA}.postcode_enrichment")
+    .filter("imd_decile IS NOT NULL")  # drop rare postcodes missing IMD coverage
+    .toPandas()
+)
+
+print(f"Loaded enrichment: {len(enrichment_pd):,} postcodes with full IMD coverage")
+
+# Sampling weights: urban 3x rural
+weights = np.where(enrichment_pd["is_urban"] == 1, 3.0, 1.0)
+weights = weights / weights.sum()
+
+np.random.seed(42)
+sampled_idx = np.random.choice(len(enrichment_pd), size=N, replace=True, p=weights)
+portfolio_base = enrichment_pd.iloc[sampled_idx].reset_index(drop=True)
+
+print(f"\nPortfolio sample: {N:,} policies")
+print(f"  Urban:   {portfolio_base['is_urban'].sum():,} ({portfolio_base['is_urban'].mean():.1%})")
+print(f"  Coastal: {portfolio_base['is_coastal'].sum():,} ({portfolio_base['is_coastal'].mean():.1%})")
+print(f"  Regions represented: {portfolio_base['region_name'].nunique()}")
+
+# COMMAND ----------
+
+# MAGIC %md
+# MAGIC ### 2b. Generate synthetic standard rating factors
+# MAGIC
+# MAGIC Each policy gets a synthetic property profile. In a real deployment these fields come
+# MAGIC from the insurer's portfolio.
 
 # COMMAND ----------
 
 np.random.seed(42)
-N = 50_000
 
-# --- Standard rating factors ---
 property_type = np.random.choice(
-    ["detached", "semi_detached", "terraced", "flat"], N, p=[0.2, 0.3, 0.3, 0.2]
+    ["detached", "semi_detached", "terraced", "flat"], N, p=[0.20, 0.30, 0.30, 0.20]
 )
 construction = np.random.choice(
-    ["brick", "timber", "stone", "other"], N, p=[0.5, 0.2, 0.2, 0.1]
+    ["brick", "timber", "stone", "other"], N, p=[0.50, 0.20, 0.20, 0.10]
 )
-year_built = np.random.randint(1900, 2024, N)
-building_age = 2025 - year_built
-bedrooms = np.random.choice([1, 2, 3, 4, 5], N, p=[0.1, 0.25, 0.35, 0.2, 0.1])
-sum_insured = np.round(
-    np.random.lognormal(mean=12.2, sigma=0.4, size=N), -3
-)
-occupancy = np.random.choice(["owner", "tenant"], N, p=[0.65, 0.35])
-prior_claims = np.random.poisson(0.15, N)
+year_built    = np.random.randint(1900, 2024, N)
+building_age  = 2025 - year_built
+bedrooms      = np.random.choice([1, 2, 3, 4, 5], N, p=[0.10, 0.25, 0.35, 0.20, 0.10])
+sum_insured   = np.round(np.random.lognormal(mean=12.2, sigma=0.4, size=N), -3)
+occupancy     = np.random.choice(["owner", "tenant"], N, p=[0.65, 0.35])
+prior_claims  = np.random.poisson(0.15, N)
 policy_tenure = np.random.randint(0, 15, N)
 
-# --- Enrichment factors (Model 2 will use these) ---
-flood_risk_zone = np.random.choice([1, 2, 3, 4], N, p=[0.50, 0.25, 0.15, 0.10])
-crime_index = np.round(np.random.beta(2, 5, N) * 100, 1)
-distance_fire_station_km = np.round(np.random.exponential(3, N), 1)
-annual_rainfall_mm = np.round(np.random.normal(800, 200, N).clip(300, 1600), 0)
-subsidence_risk = np.random.choice([0, 1], N, p=[0.85, 0.15])
+# Attach to the postcode-keyed base
+portfolio_base["property_type"] = property_type
+portfolio_base["construction"]  = construction
+portfolio_base["building_age"]  = building_age
+portfolio_base["bedrooms"]      = bedrooms
+portfolio_base["sum_insured"]   = sum_insured
+portfolio_base["occupancy"]     = occupancy
+portfolio_base["prior_claims"]  = prior_claims
+portfolio_base["policy_tenure"] = policy_tenure
 
 # COMMAND ----------
 
-# --- Encode categoricals for the true DGP ---
-prop_effect = {"detached": 0.1, "semi_detached": 0.0, "terraced": -0.05, "flat": -0.1}
-cons_effect = {"brick": -0.1, "timber": 0.2, "stone": 0.0, "other": 0.15}
-occ_effect  = {"owner": -0.05, "tenant": 0.1}
+# MAGIC %md
+# MAGIC ### 2c. Simulate claims using real enrichment features
+# MAGIC
+# MAGIC Frequency and severity are modelled as functions of **real** IMD deciles, urban/rural,
+# MAGIC coastal, and region — plus synthetic property factors. The DGP is calibrated so the
+# MAGIC overall claim rate (~14%) and average severity (~£2,600) match published UK home
+# MAGIC insurance market statistics from the ABI.
 
-prop_vec = np.array([prop_effect[p] for p in property_type])
-cons_vec = np.array([cons_effect[c] for c in construction])
-occ_vec  = np.array([occ_effect[o]  for o in occupancy])
+# COMMAND ----------
 
-# True log-frequency depends on ALL factors (enrichment effects hidden from Model 1)
+# Categorical effects
+prop_effect = {"detached": 0.10, "semi_detached": 0.00, "terraced": -0.05, "flat": -0.10}
+cons_effect = {"brick": -0.10, "timber": 0.20, "stone": 0.00, "other": 0.15}
+occ_effect  = {"owner": -0.05, "tenant": 0.10}
+
+prop_vec = portfolio_base["property_type"].map(prop_effect).values
+cons_vec = portfolio_base["construction"].map(cons_effect).values
+occ_vec  = portfolio_base["occupancy"].map(occ_effect).values
+
+# Region effects (calibrated to rough regional claim-rate differences in UK market)
+region_effect = {
+    "London":                   0.10,  # more theft, EoW
+    "South East":               0.00,
+    "South West":               0.05,  # flood / subsidence exposure
+    "East of England":          0.00,
+    "East Midlands":           -0.02,
+    "West Midlands":           -0.02,
+    "Yorkshire and The Humber": 0.00,
+    "North West":               0.03,  # rainfall, older housing stock
+    "North East":               0.00,
+}
+region_vec = portfolio_base["region_name"].map(region_effect).fillna(0.0).values
+
+# Real enrichment effects (IMD decile 1 = most deprived; we invert so higher deprivation = positive effect)
+imd_inv      = (11 - portfolio_base["imd_decile"].values) / 10     # 0..1 (1 = most deprived)
+crime_inv    = (11 - portfolio_base["crime_decile"].values) / 10   # 0..1 (1 = highest crime)
+health_inv   = (11 - portfolio_base["health_decile"].values) / 10
+living_inv   = (11 - portfolio_base["living_env_decile"].values) / 10
+is_urban_v   = portfolio_base["is_urban"].values
+is_coastal_v = portfolio_base["is_coastal"].values
+
+# True log-frequency (standard features + hidden enrichment effects)
 log_freq = (
-    -2.5
+    -2.95                                  # baseline intercept (calibrates overall frequency to ~15%)
     + prop_vec
     + cons_vec
     + occ_vec
     + 0.003 * building_age
     + 0.05  * prior_claims
     - 0.01  * policy_tenure
-    + 0.25  * (flood_risk_zone - 1) / 3
-    + 0.005 * crime_index
-    + 0.02  * (distance_fire_station_km > 5).astype(float)
-    + 0.0003 * (annual_rainfall_mm - 800)
-    + 0.3   * subsidence_risk
+    + region_vec
+    # --- real enrichment effects (hidden from Model 1) ---
+    + 0.80 * crime_inv                     # high-crime areas → more theft/malicious damage claims
+    + 0.45 * imd_inv                       # deprivation → more claims overall
+    + 0.25 * living_inv                    # poor living environment → more escape-of-water etc.
+    + 0.30 * is_coastal_v                  # coastal → more weather / flood claims
+    + 0.12 * is_urban_v                    # urban → marginal uplift
 )
 
-claim_freq = np.exp(log_freq)
-num_claims = np.random.poisson(claim_freq)
+claim_freq  = np.exp(log_freq)
+num_claims  = np.random.poisson(claim_freq)
 
+# True log-severity
 log_sev = (
     7.5
-    + 0.15 * (flood_risk_zone - 1) / 3
-    + 0.1  * subsidence_risk
+    + 0.35 * is_coastal_v                  # coastal claims more expensive (water ingress, salt damage)
+    + 0.30 * imd_inv                       # poor maintenance → costlier repairs
+    + 0.15 * crime_inv                     # higher-crime areas → larger theft claims on average
     + 0.00001 * sum_insured / 1000
-    + np.random.normal(0, 0.3, N)
+    + np.random.normal(0, 0.35, N)
 )
 claim_severity = np.where(num_claims > 0, np.exp(log_sev), 0)
-total_loss = num_claims * claim_severity
+total_loss     = num_claims * claim_severity
+
+print(f"Claim rate:      {(num_claims > 0).mean():.1%}  (target ~14%)")
+print(f"Avg frequency:   {num_claims.mean():.3f}")
+print(f"Avg severity:    £{claim_severity[num_claims > 0].mean():,.0f}  (target ~£2,600)")
+print(f"Total loss sum:  £{total_loss.sum():,.0f}")
+
+portfolio_base["num_claims"]     = num_claims
+portfolio_base["claim_severity"] = claim_severity
+portfolio_base["total_loss"]     = total_loss
 
 # COMMAND ----------
 
-df = pd.DataFrame({
-    "property_type":           property_type,
-    "construction":            construction,
-    "building_age":            building_age,
-    "bedrooms":                bedrooms,
-    "sum_insured":             sum_insured,
-    "occupancy":               occupancy,
-    "prior_claims":            prior_claims,
-    "policy_tenure":           policy_tenure,
-    "flood_risk_zone":         flood_risk_zone,
-    "crime_index":             crime_index,
-    "distance_fire_station_km": distance_fire_station_km,
-    "annual_rainfall_mm":      annual_rainfall_mm,
-    "subsidence_risk":         subsidence_risk,
-    "num_claims":              num_claims,
-    "claim_severity":          claim_severity,
-    "total_loss":              total_loss,
-})
+# MAGIC %md
+# MAGIC ### 2d. Finalise and persist to Unity Catalog
 
-# One-hot encode for modelling (cast to int to avoid uint8 arrow issues)
-df_encoded = pd.get_dummies(df, columns=["property_type", "construction", "occupancy"], drop_first=True)
+# COMMAND ----------
+
+# Assemble the portfolio table with the columns downstream code expects
+df = portfolio_base[[
+    # Standard rating factors
+    "property_type", "construction", "building_age", "bedrooms", "sum_insured",
+    "occupancy", "prior_claims", "policy_tenure",
+    # Real enrichment features
+    "imd_decile", "imd_score", "crime_decile", "income_decile",
+    "health_decile", "living_env_decile",
+    "is_urban", "is_coastal",
+    "region_name", "region_code",
+    # Geographic identifiers
+    "postcode", "lat", "long", "lsoa_code", "local_authority_code",
+    "urban_rural_band",
+    # Targets
+    "num_claims", "claim_severity", "total_loss",
+]].copy()
+
+# One-hot encode standard categoricals
+df_encoded = pd.get_dummies(
+    df,
+    columns=["property_type", "construction", "occupancy"],
+    drop_first=True,
+)
+
+# Explicitly create region dummies with safe names (no spaces, no special chars)
+region_code_to_slug = {
+    "E12000001": "region_north_east",
+    "E12000002": "region_north_west",
+    "E12000003": "region_yorkshire",
+    "E12000004": "region_east_midlands",
+    "E12000005": "region_west_midlands",
+    "E12000006": "region_east_of_england",
+    "E12000007": "region_london",
+    "E12000008": "region_south_east",
+    "E12000009": "region_south_west",
+}
+# drop_first: use East Midlands (central baseline) as reference
+reference_region = "E12000004"
+for code, slug in region_code_to_slug.items():
+    if code == reference_region:
+        continue
+    df_encoded[slug] = (df_encoded["region_code"] == code).astype(int)
+
+# Drop the raw region_name column (it's replaced by the slug dummies)
+df_encoded = df_encoded.drop(columns=["region_name"])
+
 bool_cols = df_encoded.select_dtypes(include=["bool", "uint8"]).columns
 df_encoded[bool_cols] = df_encoded[bool_cols].astype(int)
 
-# Save raw portfolio to UC
-spark.createDataFrame(df).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.portfolio")
+# Sanity check
+region_dummies = [c for c in df_encoded.columns if c.startswith("region_")]
+print(f"Region dummies created: {len(region_dummies)} -> {region_dummies}")
 
-print(f"Portfolio: {N:,} policies | Claim rate: {(num_claims > 0).mean():.1%}")
-print(f"Avg frequency: {num_claims.mean():.3f} | Avg severity (claimants): £{claim_severity[num_claims > 0].mean():,.0f}")
+# Save raw portfolio to UC. Drop region_name (redundant with region_code) — it triggers
+# a known Photon/Arrow bug when round-tripped through toPandas() in downstream notebooks.
+spark.createDataFrame(df.drop(columns=["region_name"])).write.mode("overwrite").option(
+    "overwriteSchema", "true"
+).saveAsTable(f"{CATALOG}.{SCHEMA}.portfolio")
+print(f"Saved: portfolio  ({N:,} policies)")
 
 # COMMAND ----------
 
@@ -176,6 +327,7 @@ print(f"Avg frequency: {num_claims.mean():.3f} | Avg severity (claimants): £{cl
 
 # COMMAND ----------
 
+# Standard rating factors (would be in any insurer's book)
 standard_features = [
     "building_age", "bedrooms", "sum_insured", "prior_claims", "policy_tenure",
     "property_type_flat", "property_type_semi_detached", "property_type_terraced",
@@ -183,17 +335,31 @@ standard_features = [
     "occupancy_tenant",
 ]
 
-enriched_features = standard_features + [
-    "flood_risk_zone", "crime_index", "distance_fire_station_km",
-    "annual_rainfall_mm", "subsidence_risk",
-]
+# Region dummies (9 regions -> 8 dummies after drop_first)
+region_features = sorted([c for c in df_encoded.columns if c.startswith("region_") and c != "region_code"])
+
+# Enrichment features — REAL UK public data
+enrichment_features = [
+    "imd_decile", "crime_decile", "income_decile", "health_decile", "living_env_decile",
+    "is_urban", "is_coastal",
+] + region_features
+
+enriched_features = standard_features + enrichment_features
+
+print(f"Standard features:   {len(standard_features)}")
+print(f"Enrichment features: {len(enrichment_features)}  (inc. {len(region_features)} region dummies)")
+print(f"Enriched total:      {len(enriched_features)}")
 
 train_df, test_df = train_test_split(df_encoded, test_size=0.3, random_state=42)
-print(f"Train: {len(train_df):,} | Test: {len(test_df):,}")
+print(f"\nTrain: {len(train_df):,} | Test: {len(test_df):,}")
 
 # Save train/test splits to UC
-spark.createDataFrame(train_df).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.train_set")
-spark.createDataFrame(test_df).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.test_set")
+spark.createDataFrame(train_df).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(
+    f"{CATALOG}.{SCHEMA}.train_set"
+)
+spark.createDataFrame(test_df).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(
+    f"{CATALOG}.{SCHEMA}.test_set"
+)
 print("Saved: train_set, test_set")
 
 # COMMAND ----------
@@ -204,13 +370,20 @@ print("Saved: train_set, test_set")
 # COMMAND ----------
 
 def gini_coefficient(y_true, y_pred):
-    """Ordered Lorenz / Gini for model discrimination."""
-    arr = np.array(sorted(zip(y_pred, y_true), key=lambda x: x[0]))
-    cum_actual = np.cumsum(arr[:, 1])
-    cum_actual_norm = cum_actual / cum_actual[-1]
+    """Ordered Lorenz / Gini for model discrimination.
+    Convention: higher = better (perfect model ~1, random ~0, anti-predictive < 0).
+    """
+    y_true = np.asarray(y_true)
+    y_pred = np.asarray(y_pred)
+    if y_true.sum() == 0:
+        return 0.0
+    # Sort by prediction ascending; cum_actual grows slowly for good models
+    idx = np.argsort(y_pred, kind="stable")
+    cum_actual_norm = np.cumsum(y_true[idx]) / y_true.sum()
     n = len(y_true)
+    # Area between equality line and Lorenz curve, normalized to [-1, 1]
     lorenz = cum_actual_norm.sum() / n
-    return 2 * lorenz - 1
+    return 1 - 2 * lorenz
 
 
 class GLMWrapper(mlflow.pyfunc.PythonModel):
@@ -221,7 +394,7 @@ class GLMWrapper(mlflow.pyfunc.PythonModel):
         self.features = features
 
     def predict(self, context, model_input, params=None):
-        X = sm.add_constant(model_input[self.features].astype(float))
+        X = sm.add_constant(model_input[self.features].astype(float), has_constant="add")
         return self.model.predict(X).values
 
 
@@ -229,8 +402,8 @@ def fit_and_log_glm(train, test, features, model_name, label="num_claims"):
     """Fit a Poisson GLM, log to MLflow, register in UC."""
     from mlflow.models.signature import infer_signature
 
-    X_train = sm.add_constant(train[features].astype(float))
-    X_test  = sm.add_constant(test[features].astype(float))
+    X_train = sm.add_constant(train[features].astype(float), has_constant="add")
+    X_test  = sm.add_constant(test[features].astype(float),  has_constant="add")
     y_train = train[label]
     y_test  = test[label]
 
@@ -247,7 +420,10 @@ def fit_and_log_glm(train, test, features, model_name, label="num_claims"):
     uc_model_name = f"{CATALOG}.{SCHEMA}.{model_name}"
 
     sample_input  = test[features].head(5).astype(float)
-    sample_output = pd.Series(model.predict(sm.add_constant(sample_input)), name="predicted_frequency")
+    sample_output = pd.Series(
+        model.predict(sm.add_constant(sample_input, has_constant="add")),
+        name="predicted_frequency",
+    )
     signature = infer_signature(sample_input, sample_output)
 
     with mlflow.start_run(run_name=model_name) as run:
@@ -255,7 +431,6 @@ def fit_and_log_glm(train, test, features, model_name, label="num_claims"):
             "family":     "Poisson",
             "link":       "log",
             "n_features": len(features),
-            "features":   ", ".join(features),
             "n_train":    len(train),
             "n_test":     len(test),
         })
@@ -329,15 +504,14 @@ comparison = pd.DataFrame({
     "model_2_enriched": [f"{m2[m]:.4f}" for m in metrics],
 })
 
-spark_comp = spark.createDataFrame(comparison)
-spark_comp.write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.model_comparison")
+spark.createDataFrame(comparison).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.model_comparison")
 print("Saved: model_comparison")
 
 # COMMAND ----------
 
 # --- Priced portfolio ---
-avg_severity  = df.loc[df["num_claims"] > 0, "claim_severity"].mean()
-expense_load  = 1.35
+avg_severity = df.loc[df["num_claims"] > 0, "claim_severity"].mean()
+expense_load = 1.35
 
 test_out = test_df.copy()
 test_out["pred_freq_standard"] = m1["pred_test"].values
@@ -346,7 +520,9 @@ test_out["quote_standard"]     = np.round(m1["pred_test"].values * avg_severity 
 test_out["quote_enriched"]     = np.round(m2["pred_test"].values * avg_severity * expense_load, 2)
 test_out["actual_loss"]        = test_out["total_loss"]
 
-spark.createDataFrame(test_out).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.priced_portfolio")
+spark.createDataFrame(test_out).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(
+    f"{CATALOG}.{SCHEMA}.priced_portfolio"
+)
 print("Saved: priced_portfolio")
 
 # COMMAND ----------
@@ -394,18 +570,11 @@ print("Saved: glm_coefficients")
 
 # COMMAND ----------
 
-# Load portfolio and filter to claimants only
-portfolio  = spark.table(f"{CATALOG}.{SCHEMA}.portfolio").toPandas()
-
-df_enc_sev = pd.get_dummies(portfolio, columns=["property_type", "construction", "occupancy"], drop_first=True)
-bool_cols_sev = df_enc_sev.select_dtypes(include=["bool", "uint8"]).columns
-df_enc_sev[bool_cols_sev] = df_enc_sev[bool_cols_sev].astype(int)
-
-claimants = df_enc_sev[df_enc_sev["num_claims"] > 0].copy()
-print(f"Total policies: {len(df_enc_sev):,}")
-print(f"Claimants:      {len(claimants):,} ({len(claimants)/len(df_enc_sev):.1%})")
+# Reuse the already-encoded dataframe from section 2 (avoids Photon schema issues on reload)
+claimants = df_encoded[df_encoded["num_claims"] > 0].copy()
+print(f"Total policies: {len(df_encoded):,}")
+print(f"Claimants:      {len(claimants):,} ({len(claimants)/len(df_encoded):.1%})")
 print(f"Avg severity:   £{claimants['claim_severity'].mean():,.0f}")
-print(f"Median severity: £{claimants['claim_severity'].median():,.0f}")
 
 # COMMAND ----------
 
@@ -414,8 +583,12 @@ sev_target = "claim_severity"
 sev_train_df, sev_test_df = train_test_split(claimants, test_size=0.3, random_state=42)
 print(f"Severity train: {len(sev_train_df):,} | Test: {len(sev_test_df):,}")
 
-spark.createDataFrame(sev_train_df).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.severity_train_set")
-spark.createDataFrame(sev_test_df).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.severity_test_set")
+spark.createDataFrame(sev_train_df).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(
+    f"{CATALOG}.{SCHEMA}.severity_train_set"
+)
+spark.createDataFrame(sev_test_df).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(
+    f"{CATALOG}.{SCHEMA}.severity_test_set"
+)
 print("Saved: severity_train_set, severity_test_set")
 
 # COMMAND ----------
@@ -500,7 +673,9 @@ sev_comparison = pd.DataFrame({
     "model_2_enriched": [f"{metrics_sev_enr[k]:.4f}" for k in sev_metric_keys],
 })
 
-spark.createDataFrame(sev_comparison).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.severity_model_comparison")
+spark.createDataFrame(sev_comparison).write.mode("overwrite").saveAsTable(
+    f"{CATALOG}.{SCHEMA}.severity_model_comparison"
+)
 print("Saved: severity_model_comparison")
 
 # COMMAND ----------
@@ -519,25 +694,14 @@ imp_enr = pd.DataFrame({
 imp_std["model"] = "standard"
 imp_enr["model"] = "enriched"
 imp_all = pd.concat([imp_std, imp_enr])
-spark.createDataFrame(imp_all).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.severity_feature_importance")
+spark.createDataFrame(imp_all).write.mode("overwrite").saveAsTable(
+    f"{CATALOG}.{SCHEMA}.severity_feature_importance"
+)
 print("Saved: severity_feature_importance")
 
 # Top enrichment features by gain
 print("\nTop enrichment features by gain (enriched model):")
-print(imp_enr[imp_enr["feature"].isin(enriched_features)].sort_values("importance", ascending=False).head(5).to_string(index=False))
-
-# COMMAND ----------
-
-# --- Severity by risk segment ---
-priced_freq = spark.table(f"{CATALOG}.{SCHEMA}.priced_portfolio").toPandas()
-
-for col in ["flood_risk_zone", "subsidence_risk"]:
-    seg = priced_freq.groupby(col).agg(
-        avg_actual_sev=("claim_severity", "mean"),
-        n=("actual_loss", "count"),
-    ).reset_index()
-    print(f"\n--- {col} ---")
-    print(seg.to_string(index=False))
+print(imp_enr[imp_enr["feature"].isin(enrichment_features)].sort_values("importance", ascending=False).head(5).to_string(index=False))
 
 # COMMAND ----------
 
@@ -546,13 +710,15 @@ for col in ["flood_risk_zone", "subsidence_risk"]:
 
 # COMMAND ----------
 
-# Predict severity for ALL test policies (not just claimants) using the freq test set
+# Reuse test_out from section 6 (avoids Photon schema issues on reload)
+priced_freq = test_out
+
 sev_pred_std_full = model_sev_std.predict(priced_freq[standard_features])
 sev_pred_enr_full = model_sev_enr.predict(priced_freq[enriched_features])
 
 priced_full = priced_freq.copy()
-priced_full["sev_pred_standard"]  = sev_pred_std_full
-priced_full["sev_pred_enriched"]  = sev_pred_enr_full
+priced_full["sev_pred_standard"]   = sev_pred_std_full
+priced_full["sev_pred_enriched"]   = sev_pred_enr_full
 priced_full["full_quote_standard"] = np.round(
     priced_full["pred_freq_standard"] * sev_pred_std_full * expense_load, 2
 )
@@ -560,7 +726,9 @@ priced_full["full_quote_enriched"] = np.round(
     priced_full["pred_freq_enriched"] * sev_pred_enr_full * expense_load, 2
 )
 
-spark.createDataFrame(priced_full).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.severity_priced_portfolio")
+spark.createDataFrame(priced_full).write.mode("overwrite").option("overwriteSchema", "true").saveAsTable(
+    f"{CATALOG}.{SCHEMA}.severity_priced_portfolio"
+)
 print("Saved: severity_priced_portfolio")
 print(f"Avg full quote (standard): £{priced_full['full_quote_standard'].mean():.2f}")
 print(f"Avg full quote (enriched): £{priced_full['full_quote_enriched'].mean():.2f}")
@@ -583,20 +751,24 @@ for model_name, quote_col in [("Standard", "full_quote_standard"), ("Enriched", 
     sev_lr_rows.append(grouped)
 
 sev_lr_all = pd.concat(sev_lr_rows)
-spark.createDataFrame(sev_lr_all).write.mode("overwrite").saveAsTable(f"{CATALOG}.{SCHEMA}.severity_loss_ratio_by_decile")
+spark.createDataFrame(sev_lr_all).write.mode("overwrite").saveAsTable(
+    f"{CATALOG}.{SCHEMA}.severity_loss_ratio_by_decile"
+)
 print("Saved: severity_loss_ratio_by_decile")
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## 9. Model Factory — 50 GLM Specifications
+# MAGIC
+# MAGIC The search space now varies over the **real** enrichment features. We cap the dimensionality
+# MAGIC slightly: instead of all 7+ region dummies, we treat `region_group` as a single feature.
 
 # COMMAND ----------
 
-# Load train/test sets (already in memory, but reload from UC to keep this section self-contained)
-mf_train_df = spark.table(f"{CATALOG}.{SCHEMA}.train_set").toPandas()
-mf_test_df  = spark.table(f"{CATALOG}.{SCHEMA}.test_set").toPandas()
-
+# Reuse the in-memory train/test splits from section 3 (avoids Photon schema issues on reload)
+mf_train_df = train_df.copy()
+mf_test_df  = test_df.copy()
 print(f"Model Factory — Train: {len(mf_train_df):,} | Test: {len(mf_test_df):,}")
 
 # COMMAND ----------
@@ -614,18 +786,24 @@ categorical_features = [
 
 mf_standard_features = core_features + categorical_features
 
-enrichment_features = [
-    "flood_risk_zone", "crime_index", "distance_fire_station_km",
-    "annual_rainfall_mm", "subsidence_risk",
+# Core enrichment features for the factory (7 features, drives the search space)
+mf_enrichment_features = [
+    "imd_decile", "crime_decile", "income_decile",
+    "health_decile", "is_urban", "is_coastal",
 ]
 
+# Region dummies go in or out as a group to avoid combinatorial explosion
+mf_region_group = [c for c in mf_train_df.columns if c.startswith("region_") and c != "region_code"]
+mf_region_name  = "region_group"  # pseudo-feature name for labelling specs
+
+# Interaction terms — actuarially meaningful pairings
 interaction_defs = [
-    ("flood_x_construction_timber", "flood_risk_zone",  "construction_timber"),
-    ("flood_x_building_age",        "flood_risk_zone",  "building_age"),
-    ("subsidence_x_building_age",   "subsidence_risk",  "building_age"),
-    ("subsidence_x_sum_insured",    "subsidence_risk",  "sum_insured"),
-    ("crime_x_occupancy_tenant",    "crime_index",      "occupancy_tenant"),
-    ("flood_x_subsidence",          "flood_risk_zone",  "subsidence_risk"),
+    ("crime_x_urban",         "crime_decile",     "is_urban"),
+    ("imd_x_coastal",         "imd_decile",       "is_coastal"),
+    ("imd_x_building_age",    "imd_decile",       "building_age"),
+    ("crime_x_sum_insured",   "crime_decile",     "sum_insured"),
+    ("coastal_x_sum_insured", "is_coastal",       "sum_insured"),
+    ("urban_x_bedrooms",      "is_urban",         "bedrooms"),
 ]
 
 for name, f1, f2 in interaction_defs:
@@ -634,10 +812,11 @@ for name, f1, f2 in interaction_defs:
 
 interaction_names = [name for name, _, _ in interaction_defs]
 
-print(f"Core features:        {len(core_features)}")
-print(f"Categorical features: {len(categorical_features)}")
-print(f"Enrichment features:  {len(enrichment_features)}")
-print(f"Interaction terms:    {len(interaction_names)}")
+print(f"Core features:            {len(core_features)}")
+print(f"Categorical features:     {len(categorical_features)}")
+print(f"Enrichment features:      {len(mf_enrichment_features)}")
+print(f"Region dummies (grouped): {len(mf_region_group)}")
+print(f"Interaction terms:        {len(interaction_names)}")
 
 # COMMAND ----------
 
@@ -651,75 +830,81 @@ specs.append({
     "description": "Standard rating factors only",
 })
 
-# 2-6. Standard + individual enrichment features
-for ef in enrichment_features:
+# 2-7. Standard + individual enrichment features
+for ef in mf_enrichment_features:
     specs.append({
         "name":        f"standard_plus_{ef}",
         "features":    mf_standard_features + [ef],
         "description": f"Standard + {ef}",
     })
 
-# 7-16. Standard + pairs of enrichment features
-for pair in combinations(enrichment_features, 2):
+# 8. Standard + region group
+specs.append({
+    "name":        "standard_plus_region",
+    "features":    mf_standard_features + mf_region_group,
+    "description": "Standard + region_group",
+})
+
+# 9-23. Standard + pairs of enrichment features
+for pair in combinations(mf_enrichment_features, 2):
     specs.append({
         "name":        f"standard_plus_{'_'.join(p.split('_')[0] for p in pair)}",
         "features":    mf_standard_features + list(pair),
         "description": f"Standard + {', '.join(pair)}",
     })
 
-# 17-26. Standard + triples of enrichment features
-for triple in combinations(enrichment_features, 3):
+# Standard + triples
+for triple in combinations(mf_enrichment_features, 3):
     specs.append({
         "name":        f"enrich_3_{'_'.join(t.split('_')[0] for t in triple)}",
         "features":    mf_standard_features + list(triple),
         "description": f"Standard + 3 enrichment: {', '.join(triple)}",
     })
 
-# 27-31. Standard + quads of enrichment features
-for quad in combinations(enrichment_features, 4):
-    specs.append({
-        "name":        f"enrich_4_{'_'.join(q.split('_')[0] for q in quad)}",
-        "features":    mf_standard_features + list(quad),
-        "description": f"Standard + 4 enrichment: {', '.join(quad)}",
-    })
-
-# 32. Full enrichment — no interactions
+# Full enrichment (all 6 deciles + urban + coastal)
 specs.append({
-    "name":        "full_enrichment",
-    "features":    mf_standard_features + enrichment_features,
-    "description": "Standard + all 5 enrichment features",
+    "name":        "full_enrichment_no_region",
+    "features":    mf_standard_features + mf_enrichment_features,
+    "description": f"Standard + all {len(mf_enrichment_features)} enrichment features",
 })
 
-# 33-38. Full enrichment + individual interactions
+# Full enrichment + region
+specs.append({
+    "name":        "full_enrichment_with_region",
+    "features":    mf_standard_features + mf_enrichment_features + mf_region_group,
+    "description": "Full enrichment + region_group",
+})
+
+# Full enrichment + individual interactions
 for ix in interaction_names:
     specs.append({
         "name":        f"full_plus_{ix}",
-        "features":    mf_standard_features + enrichment_features + [ix],
+        "features":    mf_standard_features + mf_enrichment_features + [ix],
         "description": f"Full enrichment + {ix}",
     })
 
-# 39-44. Full enrichment + pairs of interactions
+# Full enrichment + pairs of interactions
 for ix_pair in combinations(interaction_names, 2):
     specs.append({
         "name":        f"full_ix_{'_'.join(i.split('_')[0] for i in ix_pair)}",
-        "features":    mf_standard_features + enrichment_features + list(ix_pair),
+        "features":    mf_standard_features + mf_enrichment_features + list(ix_pair),
         "description": f"Full enrichment + interactions: {', '.join(ix_pair)}",
     })
 
-# 45+. Reduced base — drop low-importance standard features
+# Reduced base - drop some standard features
 for drop_feat in ["bedrooms", "policy_tenure"]:
     reduced = [f for f in mf_standard_features if f != drop_feat]
     specs.append({
         "name":        f"full_no_{drop_feat}",
-        "features":    reduced + enrichment_features,
+        "features":    reduced + mf_enrichment_features,
         "description": f"Full enrichment minus {drop_feat}",
     })
 
 # Kitchen sink
 specs.append({
     "name":        "kitchen_sink",
-    "features":    mf_standard_features + enrichment_features + interaction_names,
-    "description": "All features + all interactions",
+    "features":    mf_standard_features + mf_enrichment_features + mf_region_group + interaction_names,
+    "description": "All features + all interactions + region",
 })
 
 # Cap at 50
@@ -735,8 +920,8 @@ start_time = time.time()
 
 for i, spec in enumerate(specs):
     try:
-        X_train = sm.add_constant(mf_train_df[spec["features"]].astype(float))
-        X_test  = sm.add_constant(mf_test_df[spec["features"]].astype(float))
+        X_train = sm.add_constant(mf_train_df[spec["features"]].astype(float), has_constant="add")
+        X_test  = sm.add_constant(mf_test_df[spec["features"]].astype(float),  has_constant="add")
         y_train = mf_train_df[mf_target]
         y_test  = mf_test_df[mf_target]
 
@@ -795,7 +980,7 @@ for _, row in top5.iterrows():
 
 # --- Feature impact analysis ---
 feature_impact = []
-for ef in enrichment_features:
+for ef in mf_enrichment_features:
     with_feat    = results_df[results_df["description"].str.contains(ef)]["aic"].mean()
     without_feat = results_df[~results_df["description"].str.contains(ef)]["aic"].mean()
     improvement  = without_feat - with_feat
@@ -817,8 +1002,8 @@ print(impact_df.to_string(index=False))
 # COMMAND ----------
 
 summary = [
-    # Tables
-    ("TABLE", "portfolio",                      "Raw 50k synthetic home insurance portfolio"),
+    ("TABLE", "postcode_enrichment",            "Real UK postcode enrichment (built by 00a)"),
+    ("TABLE", "portfolio",                      f"{N:,} policies sampled from real postcodes with synthetic rating factors"),
     ("TABLE", "train_set",                      "Frequency model train split (70%)"),
     ("TABLE", "test_set",                       "Frequency model test split (30%)"),
     ("TABLE", "model_comparison",               "Frequency GLM metric comparison (standard vs enriched)"),
@@ -833,9 +1018,8 @@ summary = [
     ("TABLE", "severity_loss_ratio_by_decile",  "Full quote loss ratios by decile"),
     ("TABLE", "model_factory_results",          "All 50 GLM specification results ranked by AIC"),
     ("TABLE", "model_factory_feature_impact",   "Average AIC improvement per enrichment feature"),
-    # UC-registered models
     ("MODEL", "glm_frequency_standard",         "Poisson GLM — standard rating factors"),
-    ("MODEL", "glm_frequency_enriched",         "Poisson GLM — standard + geo/risk enrichment"),
+    ("MODEL", "glm_frequency_enriched",         "Poisson GLM — standard + real UK enrichment"),
 ]
 
 print(f"\n{'='*80}")

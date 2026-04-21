@@ -8,10 +8,15 @@
 # MAGIC
 # MAGIC ## What You Can Ask
 # MAGIC
+# MAGIC The underlying models were trained on a synthetic portfolio enriched with **real UK public data**
+# MAGIC (MHCLG IMD 2019 deprivation deciles, ONSPD postcode directory, ONS 2011 Rural-Urban Classification,
+# MAGIC and derived coastal flags). The agent reasons over all 50 GLM specifications and can help you:
+# MAGIC
 # MAGIC - *"What are the top 5 models by Gini coefficient?"*
-# MAGIC - *"What happens if I can't use subsidence_risk data?"*
+# MAGIC - *"What happens if I can't use crime_decile data?"*
 # MAGIC - *"Compare the baseline model against the best enriched model"*
-# MAGIC - *"Which enrichment features give the biggest improvement?"*
+# MAGIC - *"Which real-UK enrichment features give the biggest improvement?"*
+# MAGIC - *"How does adding is_coastal change model fit?"*
 # MAGIC - *"Generate a summary for model governance review"*
 
 # COMMAND ----------
@@ -251,13 +256,37 @@ You have access to the results of a model factory that trained and evaluated 50 
 specifications on a home insurance portfolio. The models are frequency models (claim count)
 using a log link function — the standard actuarial approach.
 
+## Portfolio & Feature Context
+
+- Policies and claims are **synthetic** (simulated), but each policy is keyed to a real UK
+  postcode.
+- **Enrichment features are real UK public data**:
+  * `imd_decile`, `imd_score` — Index of Multiple Deprivation (MHCLG, 2019) at LSOA level.
+    Decile 1 = most deprived, 10 = least. Lower decile typically = higher claim frequency.
+  * `crime_decile` — Crime domain of IMD 2019. Strong predictor of theft / malicious damage.
+  * `income_decile` — Income deprivation decile (IMD 2019). Correlates with housing quality,
+    occupancy patterns, and prior-claim behaviour.
+  * `health_decile` — Health & disability deprivation decile (IMD 2019). Weak positive correlate
+    of escape-of-water and accidental-damage claims.
+  * `living_env_decile` — Living environment deprivation (housing condition, air quality, road
+    safety). Strong predictor of maintenance-related claims.
+  * `is_urban` — Urban flag from ONS 2011 Rural-Urban Classification (urban = A1/B1/C1/C2 bands).
+    Urban properties exhibit higher theft and escape-of-water frequency.
+  * `is_coastal` — Derived from coastal English local authorities. Coastal properties show
+    elevated weather / water-ingress claims.
+  * `region_*` — One-hot ONS 9-region dummies. Captures residual geographic heterogeneity
+    after deprivation and urban/coastal controls.
+- Standard rating factors also present: `building_age`, `bedrooms`, `sum_insured`, `prior_claims`,
+  `policy_tenure`, property_type / construction / occupancy dummies.
+
 ## Your Role
 
 - Answer questions about model performance, feature importance, and specification comparisons
 - Explain actuarial concepts clearly when asked
 - Help actuaries make governance decisions about which model to deploy
 - Highlight trade-offs between interpretability, predictive power, and data availability
-- Flag regulatory considerations (e.g., use of certain data types, model complexity)
+- Flag regulatory considerations (e.g., deprivation-based features potentially proxying protected
+  characteristics under FCA GIPP / Equality Act 2010 / GDPR)
 
 ## Metric Guidance
 
@@ -392,13 +421,13 @@ _ = query_agent(
 
 # COMMAND ----------
 
-print("Helper output — drop_feature_impact('subsidence_risk'):")
-display(drop_feature_impact("subsidence_risk"))
+print("Helper output — drop_feature_impact('crime_decile'):")
+display(drop_feature_impact("crime_decile"))
 
 # COMMAND ----------
 
 _ = query_agent(
-    "What happens if I can't use subsidence_risk data? "
+    "What happens if I can't use crime_decile (IMD 2019 crime domain) data? "
     "Which models should I consider instead, and how much predictive power do we lose? "
     "Please give specific AIC and Gini numbers."
 )
@@ -440,9 +469,11 @@ display(feature_impact_df.sort_values("avg_aic_improvement").head(10))
 # COMMAND ----------
 
 _ = query_agent(
-    "Which enrichment features give the biggest improvement to model fit? "
+    "Which real-UK enrichment features (IMD 2019 deciles, ONSPD-derived urban/coastal flags, "
+    "ONS region dummies) give the biggest improvement to model fit? "
     "Rank the top 5 and explain what each feature likely represents in the context of home insurance. "
-    "Which features would you prioritise for a first-phase data enrichment project?"
+    "Which features would you prioritise for a first-phase data enrichment project, and what "
+    "governance considerations (e.g., deprivation as potential proxy for protected characteristics) apply?"
 )
 
 # COMMAND ----------
@@ -479,7 +510,8 @@ _ = query_agent(
 # MAGIC query_agent("Compare model_spec_12 against model_spec_25 — which has better holdout Gini?")
 # MAGIC
 # MAGIC # Explore a specific feature
-# MAGIC query_agent("How important is flood_zone_score across the model factory?")
+# MAGIC query_agent("How important is imd_decile across the model factory?")
+# MAGIC query_agent("Does is_coastal add meaningful lift on top of the region dummies?")
 # MAGIC
 # MAGIC # Get coefficient details for the best model
 # MAGIC best = model_results_df.sort_values("rank_aic").iloc[0]["name"]

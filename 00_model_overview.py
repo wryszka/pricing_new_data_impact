@@ -11,10 +11,15 @@
 # MAGIC
 # MAGIC | Step | What to do |
 # MAGIC |---|---|
-# MAGIC | **1. Build everything** | Run **01_build_all_models** once. This generates the data, trains all models, and persists everything to Unity Catalog. Takes ~3 minutes. |
-# MAGIC | **2. Pick your audience** | Open **02** (technical) or **03** (executive). Both read from the same UC tables — no retraining needed. |
-# MAGIC | **3. Governance & review** | Open **04** for the audit report, PDF export, and interactive AI review agent. |
-# MAGIC | **4. Self-service** | Use the **Lakeview dashboard** or **Genie room** for ad-hoc exploration. |
+# MAGIC | **1. Build the enrichment table** | Run **00a_build_postcode_enrichment** once. Builds the `postcode_enrichment` table from ONSPD + IMD 2019. Takes ~2 minutes. Only needs to be rerun if the source files change. |
+# MAGIC | **2. Build everything** | Run **01_build_all_models** once. Samples real postcodes, trains all models, and persists everything to Unity Catalog. Takes ~3 minutes. |
+# MAGIC | **3. Pick your audience** | Open **02** (technical) or **03** (executive). Both read from the same UC tables — no retraining needed. |
+# MAGIC | **4. Governance & review** | Open **04** for the audit report, PDF export, and interactive AI review agent. |
+# MAGIC | **5. Self-service** | Use the **Lakeview dashboard** or **Genie room** for ad-hoc exploration. |
+# MAGIC
+# MAGIC **Geographic scope:** The enrichment table covers **England only**. Scotland uses SIMD,
+# MAGIC Wales uses WIMD, and Northern Ireland uses NIMDM — these deprivation indices are not
+# MAGIC directly comparable to the English IMD and are not included in this demo.
 
 # COMMAND ----------
 
@@ -33,19 +38,38 @@
 # MAGIC %md
 # MAGIC ## What Gets Built
 # MAGIC
-# MAGIC Notebook 01 builds **everything** in a single run:
+# MAGIC The pipeline runs in two stages:
+# MAGIC
+# MAGIC ### Stage 1 — Notebook 00a (one-off, reusable)
+# MAGIC
+# MAGIC Builds `postcode_enrichment` — a single wide table keyed on UK postcode, containing real
+# MAGIC public data for every English postcode: IMD 2019 deciles (overall, crime, income, health,
+# MAGIC living environment), ONS Rural-Urban Classification, coastal flag derived from coastal
+# MAGIC local authorities, region name, LSOA code, and local authority code. Sourced from:
+# MAGIC
+# MAGIC - **ONSPD** — Office for National Statistics Postcode Directory (lat/long, LSOA, LA, region)
+# MAGIC - **IMD 2019** — Ministry of Housing, Communities & Local Government English Indices of Deprivation
+# MAGIC - **ONS RUC 2011** — Rural-Urban Classification of Output Areas
+# MAGIC
+# MAGIC ### Stage 2 — Notebook 01 (pricing pipeline)
 # MAGIC
 # MAGIC ```
 # MAGIC ┌─────────────────────────────────────────────────────────────┐
-# MAGIC │  1. Data Generation          50,000 synthetic policies      │
-# MAGIC │  2. Train/Test Split         70/30                          │
-# MAGIC │  3. Frequency GLMs           Standard vs Enriched (Poisson) │
-# MAGIC │  4. Severity GBMs            Standard vs Enriched (Gamma)   │
-# MAGIC │  5. Model Factory            50 GLM specifications ranked   │
-# MAGIC │  6. Full Quotes              Freq × Sev × Expense Load      │
-# MAGIC │  7. Persist to UC            15 tables + 2 MLflow models    │
+# MAGIC │  1. Sample Postcodes         200k real English postcodes    │
+# MAGIC │  2. Synthetic Rating Factors Property type, age, sum ins.   │
+# MAGIC │  3. Simulate Claims          Poisson freq + Gamma sev       │
+# MAGIC │  4. Train/Test Split         70/30                          │
+# MAGIC │  5. Frequency GLMs           Standard vs Enriched (Poisson) │
+# MAGIC │  6. Severity GBMs            Standard vs Enriched (Gamma)   │
+# MAGIC │  7. Model Factory            50 GLM specifications ranked   │
+# MAGIC │  8. Full Quotes              Freq × Sev × Expense Load      │
+# MAGIC │  9. Persist to UC            16 tables + 2 MLflow models    │
 # MAGIC └─────────────────────────────────────────────────────────────┘
 # MAGIC ```
+# MAGIC
+# MAGIC Each demo policy is assigned a real English postcode and inherits its real
+# MAGIC enrichment features. Only the property-level rating factors (construction, bedrooms,
+# MAGIC sum insured) are synthetic — in a real deployment they come from the insurer's book.
 
 # COMMAND ----------
 
@@ -89,8 +113,8 @@
 # MAGIC
 # MAGIC ### Why GBM for Severity?
 # MAGIC
-# MAGIC - **Non-linear interactions** — flood + subsidence together is disproportionately expensive
-# MAGIC - **Handles heterogeneity** — burst pipe (£2k) vs subsidence (£50k) in the same model
+# MAGIC - **Non-linear interactions** — high deprivation + coastal location is disproportionately expensive
+# MAGIC - **Handles heterogeneity** — small theft (£500) vs major escape-of-water (£20k+) in the same model
 # MAGIC - **Complementary to GLM** — GLM for frequency (transparent) + GBM for severity (flexible)
 # MAGIC   is a common actuarial pattern
 # MAGIC
@@ -115,8 +139,9 @@
 # MAGIC
 # MAGIC | Search dimension | Variants |
 # MAGIC |---|---|
-# MAGIC | Enrichment feature subsets | All 31 combinations of 5 features |
-# MAGIC | Interaction terms | 6 actuarially meaningful pairings (flood×construction, subsidence×age, etc.) |
+# MAGIC | Enrichment feature subsets | Singles, pairs and triples of 6 enrichment features (IMD, crime, income, health, urban, coastal) |
+# MAGIC | Region dummies | With / without the 8-region-dummy group |
+# MAGIC | Interaction terms | 6 actuarially meaningful pairings (crime×urban, imd×coastal, coastal×sum_insured, etc.) |
 # MAGIC | Interaction combinations | Pairs of interaction terms |
 # MAGIC | Base feature variations | Dropping low-importance standard features |
 # MAGIC | Kitchen sink | All features + all interactions |
@@ -154,55 +179,72 @@
 # MAGIC | `construction_*` | Binary | One-hot: other, stone, timber (brick = baseline) |
 # MAGIC | `occupancy_tenant` | Binary | 1 = tenant, 0 = owner-occupied |
 # MAGIC
-# MAGIC ### Model 2 — Enriched (17 features)
+# MAGIC ### Model 2 — Enriched (standard + real UK public data)
 # MAGIC
-# MAGIC Everything in Model 1, **plus** external/geospatial enrichment data:
+# MAGIC Everything in Model 1, **plus** real geospatial enrichment joined from the
+# MAGIC `postcode_enrichment` table on each policy's postcode:
 # MAGIC
-# MAGIC | Feature | Type | Description |
-# MAGIC |---|---|---|
-# MAGIC | `flood_risk_zone` | Ordinal (1–4) | EA-style flood zone: 1 = low, 4 = high |
-# MAGIC | `crime_index` | Continuous (0–100) | Neighbourhood crime score (Beta distribution) |
-# MAGIC | `distance_fire_station_km` | Continuous | Distance to nearest fire station (Exponential) |
-# MAGIC | `annual_rainfall_mm` | Continuous | Local annual rainfall (Normal, clipped 300–1600) |
-# MAGIC | `subsidence_risk` | Binary (0/1) | Ground subsidence indicator (15% prevalence) |
+# MAGIC | Feature | Type | Source | Description |
+# MAGIC |---|---|---|---|
+# MAGIC | `imd_decile` | Ordinal (1–10) | IMD 2019 | Overall deprivation decile (1 = most deprived, 10 = least) |
+# MAGIC | `imd_score` | Continuous | IMD 2019 | Raw IMD score (higher = more deprived) |
+# MAGIC | `crime_decile` | Ordinal (1–10) | IMD 2019 | Crime deprivation decile (1 = highest crime) |
+# MAGIC | `income_decile` | Ordinal (1–10) | IMD 2019 | Income deprivation decile (1 = most income-deprived) |
+# MAGIC | `health_decile` | Ordinal (1–10) | IMD 2019 | Health deprivation decile (1 = most health-deprived) |
+# MAGIC | `living_env_decile` | Ordinal (1–10) | IMD 2019 | Living environment decile (1 = worst) |
+# MAGIC | `is_urban` | Binary (0/1) | ONS RUC 2011 | Urban/rural classification |
+# MAGIC | `is_coastal` | Binary (0/1) | Derived | Derived from coastal local authorities |
+# MAGIC | `region_*` | Binary | ONSPD | One-hot encoded region dummies (8 dummies; East Midlands = baseline) |
+# MAGIC
+# MAGIC The portfolio table also carries identifier columns — `postcode`, `lat`, `long`,
+# MAGIC `lsoa_code`, `local_authority_code`, `urban_rural_band` — for downstream geospatial
+# MAGIC analysis and joining to other datasets.
 
 # COMMAND ----------
 
 # MAGIC %md
 # MAGIC ## Data-Generating Process
 # MAGIC
-# MAGIC The synthetic data is constructed so that the **true risk depends on ALL features**,
-# MAGIC including the enrichment variables. This is the key design choice:
+# MAGIC Claims are simulated so the **true risk depends on ALL features**, including the real
+# MAGIC enrichment variables attached to each postcode. The DGP is calibrated to reproduce
+# MAGIC published UK home-insurance market statistics (~15% claim rate, ~£2,600 average
+# MAGIC severity, ABI market data).
 # MAGIC
 # MAGIC ```
 # MAGIC log(expected_claims) =
-# MAGIC     −2.5                                          (baseline)
-# MAGIC   + property_type effect                          (−0.1 to +0.1)
-# MAGIC   + construction effect                           (−0.1 to +0.2)
-# MAGIC   + occupancy effect                              (−0.05 to +0.1)
+# MAGIC     −2.95                                         (baseline, tunes overall freq to ~15%)
+# MAGIC   + property_type effect                          (−0.10 to +0.10)
+# MAGIC   + construction effect                           (−0.10 to +0.20)
+# MAGIC   + occupancy effect                              (−0.05 to +0.10)
 # MAGIC   + 0.003 × building_age
 # MAGIC   + 0.05  × prior_claims
 # MAGIC   − 0.01  × policy_tenure
-# MAGIC   + 0.25  × (flood_risk_zone − 1) / 3            ← hidden from Model 1
-# MAGIC   + 0.005 × crime_index                           ← hidden from Model 1
-# MAGIC   + 0.02  × I(distance_fire_station > 5km)        ← hidden from Model 1
-# MAGIC   + 0.0003 × (annual_rainfall − 800)              ← hidden from Model 1
-# MAGIC   + 0.3   × subsidence_risk                       ← hidden from Model 1
+# MAGIC   + region_effect                                 (−0.02 to +0.10; London highest)
+# MAGIC   + 0.80  × crime_inv                             ← hidden from Model 1
+# MAGIC   + 0.45  × imd_inv                               ← hidden from Model 1
+# MAGIC   + 0.25  × living_inv                            ← hidden from Model 1
+# MAGIC   + 0.30  × is_coastal                            ← hidden from Model 1
+# MAGIC   + 0.12  × is_urban                              ← hidden from Model 1
+# MAGIC
+# MAGIC   where  crime_inv   = (11 − crime_decile) / 10     (0..1, 1 = highest crime)
+# MAGIC          imd_inv     = (11 − imd_decile) / 10       (0..1, 1 = most deprived)
+# MAGIC          living_inv  = (11 − living_env_decile) / 10
 # MAGIC ```
 # MAGIC
-# MAGIC Severity also depends on enrichment features:
+# MAGIC Severity also depends on the real enrichment features:
 # MAGIC
 # MAGIC ```
 # MAGIC log(claim_severity) =
 # MAGIC     7.5
-# MAGIC   + 0.15 × (flood_risk_zone − 1) / 3
-# MAGIC   + 0.1  × subsidence_risk
+# MAGIC   + 0.35 × is_coastal                             (water ingress, salt damage)
+# MAGIC   + 0.30 × imd_inv                                (poor maintenance → costlier repairs)
+# MAGIC   + 0.15 × crime_inv                              (higher theft claim sizes)
 # MAGIC   + 0.00001 × sum_insured / 1000
-# MAGIC   + noise ~ N(0, 0.3)
+# MAGIC   + noise ~ N(0, 0.35)
 # MAGIC ```
 # MAGIC
 # MAGIC Because Model 1 cannot see the enrichment features, it **systematically misprices**
-# MAGIC policies where those features matter most.
+# MAGIC policies in high-crime, deprived, or coastal postcodes.
 
 # COMMAND ----------
 
@@ -228,13 +270,19 @@
 # MAGIC
 # MAGIC All outputs are persisted to `lr_serverless_aws_us_catalog.pricing_new_data_impact`:
 # MAGIC
+# MAGIC ### Enrichment Reference Table
+# MAGIC
+# MAGIC | Artefact | Table | Created by |
+# MAGIC |---|---|---|
+# MAGIC | Real UK postcode enrichment (~1.3M English postcodes) | `.postcode_enrichment` | 00a |
+# MAGIC
 # MAGIC ### Data Tables
 # MAGIC
 # MAGIC | Artefact | Table | Created by |
 # MAGIC |---|---|---|
-# MAGIC | Raw portfolio (50k policies) | `.portfolio` | 01 |
-# MAGIC | Training set (35k, one-hot encoded) | `.train_set` | 01 |
-# MAGIC | Test set (15k, one-hot encoded) | `.test_set` | 01 |
+# MAGIC | Raw portfolio (200k policies sampled from real postcodes) | `.portfolio` | 01 |
+# MAGIC | Training set (140k, one-hot encoded) | `.train_set` | 01 |
+# MAGIC | Test set (60k, one-hot encoded) | `.test_set` | 01 |
 # MAGIC | Severity training set (claimants only) | `.severity_train_set` | 01 |
 # MAGIC | Severity test set (claimants only) | `.severity_test_set` | 01 |
 # MAGIC
@@ -285,7 +333,8 @@
 # MAGIC | # | Notebook | Audience | What it does | Run order |
 # MAGIC |---|---|---|---|---|
 # MAGIC | **00** | `model_overview` | Everyone | This notebook — documentation and run guide | Read anytime |
-# MAGIC | **01** | `build_all_models` | Run once | Generates data, trains freq GLMs + sev GBMs + 50-model factory, persists all to UC | **Run first** |
+# MAGIC | **00a** | `build_postcode_enrichment` | Run once | Builds `postcode_enrichment` (1.3M English postcodes) from ONSPD + IMD 2019 + RUC 2011. Only rerun when source files change. | **Run first** |
+# MAGIC | **01** | `build_all_models` | Run once | Samples real postcodes, trains freq GLMs + sev GBMs + 50-model factory, persists all to UC | **Run second** |
 # MAGIC | **02** | `results_technical` | Data scientists, actuaries | Full technical walkthrough — metrics, coefficients, feature importance, model factory charts, model serving | After 01 |
 # MAGIC | **03** | `results_executive` | Business stakeholders | Plain-English walkthrough — same data, no jargon, with glossary | After 01 |
 # MAGIC | **04** | `model_governance` | Governance / regulatory | Model governance report with PDF export to UC volume | After 01 |
