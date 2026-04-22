@@ -30,7 +30,7 @@
 
 # COMMAND ----------
 
-# MAGIC %pip install matplotlib mlflow
+# MAGIC %pip install matplotlib mlflow statsmodels scikit-learn
 
 # COMMAND ----------
 
@@ -656,7 +656,14 @@ print(impact_df.to_string(index=False))
 
 # COMMAND ----------
 
-# Load the latest registered version — older versions may have stale feature schemas
+# Load the latest registered version — older versions may have stale feature schemas.
+# Suppress MLflow's version-mismatch warnings: the training env (notebook 01) and the
+# loading env here may pin slightly different numpy/statsmodels/Python versions, but
+# a simple Poisson GLM unpickles cleanly across the ranges we use.
+import logging
+logging.getLogger("mlflow.utils.requirements_utils").setLevel(logging.ERROR)
+logging.getLogger("mlflow.pyfunc").setLevel(logging.ERROR)
+
 from mlflow.tracking import MlflowClient
 _client = MlflowClient(registry_uri="databricks-uc")
 _uc_model_name = f"{CATALOG}.{SCHEMA}.glm_frequency_enriched"
