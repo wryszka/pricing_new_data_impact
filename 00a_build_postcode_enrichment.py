@@ -19,7 +19,7 @@
 # MAGIC All datasets are Open Government Licence (OGL) — free for any use including commercial.
 # MAGIC
 # MAGIC **Output:** `lr_serverless_aws_us_catalog.pricing_new_data_impact.postcode_enrichment`
-# MAGIC (~1.3M England live residential postcodes with ~12 enrichment features)
+# MAGIC (~1.5M England live residential postcodes with ~12 enrichment features)
 
 # COMMAND ----------
 
@@ -116,7 +116,7 @@ download_if_missing(IMD_URL, IMD_PATH, "IMD 2019 File 7")
 # MAGIC - **Country code E92000001** (England only)
 # MAGIC - **`doterm` is null** (live postcodes only — `doterm` is the termination date)
 # MAGIC
-# MAGIC This leaves ~1.3M England live postcodes.
+# MAGIC This leaves ~1.5M England live postcodes.
 
 # COMMAND ----------
 

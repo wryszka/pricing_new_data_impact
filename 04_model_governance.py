@@ -767,7 +767,7 @@ print(f"  This represents a material reduction in model quality that would requi
 # MAGIC |---|---|
 # MAGIC | **Policy & claim records** | Synthetic — generated programmatically in notebook `01_build_all_models.py` |
 # MAGIC | **Enrichment features** | **Real UK public data** — ONSPD postcode directory, MHCLG IMD 2019 (LSOA deciles), ONS 2011 Rural-Urban Classification, coastal local-authority derivation |
-# MAGIC | **Sample size** | 50,000 simulated home insurance policies, each keyed to a real UK postcode |
+# MAGIC | **Sample size** | 200,000 simulated home insurance policies, each keyed to a real English postcode |
 # MAGIC | **Train/test split** | 70% / 30% random split (seed = 42) |
 # MAGIC | **Policy period** | Single-period; no longitudinal dimension |
 # MAGIC
@@ -985,7 +985,7 @@ report_lines += [
     "-" * 40,
     "  - Policies and claims are synthetic (not real portfolio experience)",
     "  - Enrichment features are REAL UK public data: IMD 2019 (MHCLG), ONSPD (ONS), ONS RUC 2011",
-    "  - 50,000 simulated home insurance policies keyed to real UK postcodes",
+    "  - 200,000 simulated home insurance policies keyed to real English postcodes",
     "  - No temporal or exposure-weighted effects modelled",
     "  - Enrichment deciles constant within LSOA (spatial granularity limit)",
     "  - Regulatory permissibility of deprivation-based features requires review (FCA GIPP, Equality Act, GDPR)",
@@ -1362,7 +1362,7 @@ pdf.section_heading("Section 4 — Performance Evidence")
 
 pdf.set_font("Helvetica", "", 9)
 pdf.multi_cell(0, 5,
-    "Performance is assessed on held-out test data (30% of 50,000 policies). "
+    "Performance is assessed on held-out test data (30% of 200,000 policies). "
     "The enriched model is compared against the standard baseline across AIC, Gini, deviance explained, "
     "and loss ratio stability by premium decile."
 )
@@ -1493,7 +1493,7 @@ pdf.section_heading("6.1  Data Source", level=2)
 datasource_rows = [
     ["Policies & claims",  "Synthetic — generated programmatically in 01_build_all_models.py"],
     ["Enrichment features","Real UK public data: IMD 2019 (MHCLG), ONSPD (ONS), ONS RUC 2011, coastal LAs"],
-    ["Sample size",        "50,000 simulated home insurance policies keyed to real UK postcodes"],
+    ["Sample size",        "200,000 simulated home insurance policies keyed to real English postcodes"],
     ["Train/test split",   "70% / 30% random split (seed = 42)"],
     ["Policy period",      "Single-period; no longitudinal dimension"],
 ]

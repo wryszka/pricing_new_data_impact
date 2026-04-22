@@ -92,7 +92,7 @@ print(f"Schema  : {SCHEMA}")
 # MAGIC
 # MAGIC ### 2a. Sample real postcodes from the enrichment table
 # MAGIC
-# MAGIC We draw N postcodes from `postcode_enrichment` (the ~1.3M England postcodes built in
+# MAGIC We draw N postcodes from `postcode_enrichment` (the ~1.5M England postcodes built in
 # MAGIC notebook 00a) weighted by urban density — so the demo portfolio approximately mirrors
 # MAGIC where insured households actually live.
 
@@ -175,7 +175,7 @@ portfolio_base["policy_tenure"] = policy_tenure
 # MAGIC
 # MAGIC Frequency and severity are modelled as functions of **real** IMD deciles, urban/rural,
 # MAGIC coastal, and region — plus synthetic property factors. The DGP is calibrated so the
-# MAGIC overall claim rate (~14%) and average severity (~£2,600) match published UK home
+# MAGIC overall claim rate (~15%) and average severity (~£2,600) match published UK home
 # MAGIC insurance market statistics from the ABI.
 
 # COMMAND ----------
@@ -244,7 +244,7 @@ log_sev = (
 claim_severity = np.where(num_claims > 0, np.exp(log_sev), 0)
 total_loss     = num_claims * claim_severity
 
-print(f"Claim rate:      {(num_claims > 0).mean():.1%}  (target ~14%)")
+print(f"Claim rate:      {(num_claims > 0).mean():.1%}  (target ~15%)")
 print(f"Avg frequency:   {num_claims.mean():.3f}")
 print(f"Avg severity:    £{claim_severity[num_claims > 0].mean():,.0f}  (target ~£2,600)")
 print(f"Total loss sum:  £{total_loss.sum():,.0f}")
@@ -1002,7 +1002,7 @@ print(impact_df.to_string(index=False))
 # COMMAND ----------
 
 summary = [
-    ("TABLE", "postcode_enrichment",            "Real UK postcode enrichment (built by 00a)"),
+    ("INPUT", "postcode_enrichment",            "Real UK postcode enrichment (built by 00a — dependency)"),
     ("TABLE", "portfolio",                      f"{N:,} policies sampled from real postcodes with synthetic rating factors"),
     ("TABLE", "train_set",                      "Frequency model train split (70%)"),
     ("TABLE", "test_set",                       "Frequency model test split (30%)"),

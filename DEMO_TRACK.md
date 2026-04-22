@@ -28,8 +28,8 @@ and common Q&A. Tune the length by picking which notebooks to show.
 
 **Hero numbers to memorise** (from the latest run):
 
-- Claim rate: **16.3%** (ABI-realistic for UK home)
-- Avg severity: **£2,914** (ABI-realistic)
+- Claim rate: **~16%** (observed; ABI-realistic for UK home)
+- Avg severity: **~£2,900** (observed; ABI-realistic)
 - Frequency: Deviance Explained **1.0% → 5.3%** (5× improvement)
 - Frequency: Gini **0.11 → 0.25** (2.3× improvement)
 - Severity: MAE **£951 → £829** (-13%)
@@ -79,7 +79,7 @@ The question behind the question an actuary will ask: **"Is this reproducible, a
 
 ### Notebook 01 — Build All Models (run once before, skim in demo, ~5 min)
 
-- Jump to **Section 2c — Simulate claims**. Show the DGP formula. Talking point: *"We calibrate to published UK market statistics — 15% claim rate, ~£2,900 average severity. The enrichment features drive both frequency and severity, and the baseline model can't see them."*
+- Jump to **Section 2c — Simulate claims**. Show the DGP formula. Talking point: *"We calibrate to published UK market statistics — ~15% claim rate, ~£2,600 average severity, both in line with ABI figures. The enrichment features drive both frequency and severity, and the baseline model can't see them."*
 - Jump to **Section 5 — Train Frequency GLMs**. Show the output: Gini 0.11 (standard) → 0.25 (enriched). Pause here — this is the money shot.
 - Jump to **Section 9 — Model Factory**. Talking point: *"Instead of manually trying 5 model variants in Radar, we programmatically train 50 Poisson GLM specifications in under a minute. Every spec is ranked by AIC, BIC, and Gini. Full audit trail in Unity Catalog."*
 - Don't linger. The point is that the build is fast, reproducible, and persisted.

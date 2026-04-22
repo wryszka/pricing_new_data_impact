@@ -11,8 +11,8 @@
 # MAGIC
 # MAGIC | Step | What to do |
 # MAGIC |---|---|
-# MAGIC | **1. Build the enrichment table** | Run **00a_build_postcode_enrichment** once. Builds the `postcode_enrichment` table from ONSPD + IMD 2019. Takes ~2 minutes. Only needs to be rerun if the source files change. |
-# MAGIC | **2. Build everything** | Run **01_build_all_models** once. Samples real postcodes, trains all models, and persists everything to Unity Catalog. Takes ~3 minutes. |
+# MAGIC | **1. Build the enrichment table** | Run **00a_build_postcode_enrichment** once. Builds the `postcode_enrichment` table from ONSPD + IMD 2019. ~7 min first run (downloads 2.3 GB ONSPD), ~3 min subsequent runs. Only needs to be rerun if the source files change. |
+# MAGIC | **2. Build everything** | Run **01_build_all_models** once. Samples real postcodes, trains all models, and persists everything to Unity Catalog. Takes ~10 minutes. |
 # MAGIC | **3. Pick your audience** | Open **02** (technical) or **03** (executive). Both read from the same UC tables — no retraining needed. |
 # MAGIC | **4. Governance & review** | Open **04** for the audit report, PDF export, and interactive AI review agent. |
 # MAGIC | **5. Self-service** | Use the **Lakeview dashboard** or **Genie room** for ad-hoc exploration. |
@@ -63,7 +63,7 @@
 # MAGIC │  6. Severity GBMs            Standard vs Enriched (Gamma)   │
 # MAGIC │  7. Model Factory            50 GLM specifications ranked   │
 # MAGIC │  8. Full Quotes              Freq × Sev × Expense Load      │
-# MAGIC │  9. Persist to UC            16 tables + 2 MLflow models    │
+# MAGIC │  9. Persist to UC            15 tables + 2 MLflow models    │
 # MAGIC └─────────────────────────────────────────────────────────────┘
 # MAGIC ```
 # MAGIC
@@ -84,8 +84,8 @@
 # MAGIC | **Link function** | Log (ensures predictions are always ≥ 0) |
 # MAGIC | **Target variable** | `num_claims` — integer count of claims per policy |
 # MAGIC | **Implementation** | `statsmodels.GLM` — actuarial-grade outputs with p-values, CIs |
-# MAGIC | **Training data** | 35,000 policies (70% of 50,000 synthetic portfolio) |
-# MAGIC | **Test data** | 15,000 policies (30%) |
+# MAGIC | **Training data** | 140,000 policies (70% of the 200,000 sampled portfolio) |
+# MAGIC | **Test data** | 60,000 policies (30%) |
 # MAGIC
 # MAGIC ### Why Poisson GLM?
 # MAGIC
@@ -274,7 +274,7 @@
 # MAGIC
 # MAGIC | Artefact | Table | Created by |
 # MAGIC |---|---|---|
-# MAGIC | Real UK postcode enrichment (~1.3M English postcodes) | `.postcode_enrichment` | 00a |
+# MAGIC | Real UK postcode enrichment (~1.5M English postcodes) | `.postcode_enrichment` | 00a |
 # MAGIC
 # MAGIC ### Data Tables
 # MAGIC
@@ -333,7 +333,7 @@
 # MAGIC | # | Notebook | Audience | What it does | Run order |
 # MAGIC |---|---|---|---|---|
 # MAGIC | **00** | `model_overview` | Everyone | This notebook — documentation and run guide | Read anytime |
-# MAGIC | **00a** | `build_postcode_enrichment` | Run once | Builds `postcode_enrichment` (1.3M English postcodes) from ONSPD + IMD 2019 + RUC 2011. Only rerun when source files change. | **Run first** |
+# MAGIC | **00a** | `build_postcode_enrichment` | Run once | Builds `postcode_enrichment` (1.5M English postcodes) from ONSPD + IMD 2019 + RUC 2011. Only rerun when source files change. | **Run first** |
 # MAGIC | **01** | `build_all_models` | Run once | Samples real postcodes, trains freq GLMs + sev GBMs + 50-model factory, persists all to UC | **Run second** |
 # MAGIC | **02** | `results_technical` | Data scientists, actuaries | Full technical walkthrough — metrics, coefficients, feature importance, model factory charts, model serving | After 01 |
 # MAGIC | **03** | `results_executive` | Business stakeholders | Plain-English walkthrough — same data, no jargon, with glossary | After 01 |
